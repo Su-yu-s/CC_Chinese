@@ -1,0 +1,18 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 构建产物
+dist/
+release/
+build/
+
+# Inno Setup 安装包脚本（构建用）
+*.iss
+
+# 测试文件
+tests/
+
+# 下载的 UPX 二进制
+scripts/upx/
