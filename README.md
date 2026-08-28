@@ -21,7 +21,9 @@ CC_Chinese 在此基础上重新设计了用户交互层：采用 PySide6 构建
 
 - 自动检测 WindowsApps 和 AppData 版 Claude Desktop 安装目录
 - 手动选择 Claude `app` 目录（检测失败时）
+- <img width="552" height="618" alt="3b40ef32196048168ffbad116f3d9111" src="https://github.com/user-attachments/assets/d7221228-d838-4fe4-87ee-d7934508a4bc" />
 - 一键安装中文补丁（JSON 资源 + JS chunk 硬编码文案）
+- <img width="550" height="618" alt="QQ_1787917105456" src="https://github.com/user-attachments/assets/566357a0-1018-4622-83c4-369afd352fe4" />
 - 一键恢复官方英文文件
 - 后台执行补丁，前台显示进度与实时日志，窗口可自由拖拽
 - 单实例锁防多开，PyInstaller onedir 打包避免临时目录问题
