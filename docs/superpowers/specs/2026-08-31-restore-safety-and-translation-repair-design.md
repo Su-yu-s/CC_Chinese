@@ -5,6 +5,7 @@
 - 日期：2026-08-31
 - 范围：CC_Chinese 安装、备份、恢复、检测、权限、GUI 生命周期及五项侧栏翻译
 - 用户已确认：采用“隔离不兼容旧备份并拒绝恢复”的安全策略
+- 关联产品规格：`docs/superpowers/specs/2026-09-01-product-trust-and-continuous-compatibility-design.md`
 
 ## 背景与已确认事实
 
@@ -77,6 +78,7 @@ payload 中的每个文件均相对于 `app/resources` 保存完整路径。chun
 - install-id 与完整安装身份字段；
 - 创建时间与补丁版本；
 - 快照状态：`staging`、`complete` 或 `invalid`；
+- 基线是否已经封存（`baseline_sealed`）及封存时间；
 - 每个文件的 resources 相对路径；
 - 原文件是否存在；
 - 原文件 SHA-256；
@@ -85,9 +87,21 @@ payload 中的每个文件均相对于 `app/resources` 保存完整路径。chun
 - 原始 locale 键是否存在及其 JSON 值；
 - 原始字体配置键是否存在及其 JSON 值；
 - 原始配置文件路径；
+- 所有临时权限目标（文件或父目录）的原 owner、DACL、继承标志与文件属性；
 - 本次创建、修改和注入的操作清单。
 
 Manifest 元数据与 payload 分离。恢复只遍历 manifest 的文件清单，绝不递归复制快照根目录。
+
+状态与“基线可用于事务回滚”是两个不同维度：
+
+- `staging + baseline_sealed=false`：仍在复制或校验，不允许修改目标；
+- `staging + baseline_sealed=true`：所有原始 payload 和哈希已经落盘，可供本次安装失败时内部回滚，但不能作为用户主动恢复来源；
+- `complete + baseline_sealed=true`：补丁及最终检测均成功，可供后续安全恢复；
+- `invalid`：快照或回滚不完整，不允许继续写入或恢复。
+
+安装前门禁要求的是“已封存的 staging 基线”或既有匹配的 complete 快照，而不是提前把 manifest 标记为 complete。只有补丁后检测通过才能提交为 complete。
+
+普通可写安装的快照继续位于当前用户的 LocalAppData。需要管理员权限修改 WindowsApps 时，快照由受保护的提权子流程写入 ProgramData 下同名、仅管理员可修改而普通用户只读的快照树；用户可写快照不得作为管理员恢复的 payload。旧 LocalAppData 目录仍按旧备份隔离规则保留，不迁移、不删除。
 
 ## 2. 旧备份隔离策略
 
@@ -113,7 +127,12 @@ Manifest 元数据与 payload 分离。恢复只遍历 manifest 的文件清单�
 - 所有待注入或更新运行时的 index bundle；
 - locale 与字体配置目标。
 
-在任何写入前完成：安装身份计算、旧快照兼容性判断、目标可读性检查、精确权限准备及原始文件快照。
+mutation plan 将目标分为两类：
+
+- 官方资源目标：JSON、JS、bundle 和注入运行时，创建新快照时必须匹配 profile 定义的官方补丁前状态；
+- 用户配置目标：locale、字体等配置允许任意 schema-valid 原值，不参与“官方 clean”判定，但必须在 sealed baseline 中逐值保存键是否存在、原 JSON 值和配置路径。
+
+先以只读方式完成安装身份、旧快照兼容性、profile、基线状态与目标可读性检查。随后封存原始文件、用户配置原值以及可能临时调整权限的文件/父目录 security descriptor。只有 baseline 完全封存后才允许执行精确权限准备；权限变化本身也属于事务，必须在成功、失败和恢复退出前还原。
 
 ### 3.2 备份门禁
 
@@ -124,7 +143,9 @@ Manifest 元数据与 payload 分离。恢复只遍历 manifest 的文件清单�
 - 零目标文件被修改；
 - GUI 显示失败目标与原因。
 
-重复汉化同一 install-id 时复用首次 `complete` 快照，不覆盖最初的官方基线，不覆盖 locale 原值。
+这里的“零目标文件”不禁止 staging 自身落盘。失败后优先删除未封存 staging；若清理失败或需要保留诊断证据，则只允许留下 `invalid`，不得留下看似可用的 sealed/complete 状态。Claude 文件、配置和 ACL 必须保持未操作状态。
+
+重复汉化同一 install-id 时复用首次 `complete` 快照，不覆盖最初的官方资源基线，不覆盖 locale/字体原值。新建快照前还必须证明所有官方资源目标均处于该 profile 定义的官方补丁前状态；用户配置只要求 schema-valid 并逐值保存。旧补丁、第三方资源修改或部分汉化即使保留了结构锚点，也不得被保存为官方基线。
 
 ### 3.3 原子写入与提交
 
@@ -136,7 +157,7 @@ Manifest 元数据与 payload 分离。恢复只遍历 manifest 的文件清单�
 4. 使用 `os.replace` 原子替换；
 5. 失败时删除临时文件，原目标保持不变。
 
-每次文件修改后记录补丁后 SHA-256。全部步骤及安装后检测通过后，manifest 才从 `staging` 切换为 `complete`。若中途失败或最终检测失败，安装器使用 staging 中的原文件回滚已修改目标，并恢复配置原值。
+每次文件修改后记录补丁后 SHA-256。只有 `staging` 基线已经封存才允许第一次目标写入；全部步骤及安装后检测通过后，manifest 才从 `staging` 切换为 `complete`。若中途失败或最终检测失败，安装器使用已封存 staging 中的原文件回滚已修改目标，并恢复配置原值。成功回滚后该 staging 可安全废弃；回滚不完整则标记 invalid 并报告具体目标。
 
 ## 4. 安全恢复
 
@@ -166,6 +187,8 @@ Manifest 元数据与 payload 分离。恢复只遍历 manifest 的文件清单�
 - 恢复不复制 `patch-state.json`、`chunk-state.json` 或任何未列入 manifest 的文件。
 
 提交前暂存当前补丁文件，以便恢复阶段发生意外时回滚到恢复前状态。全部恢复成功后删除或失效当前安装的补丁状态缓存，但保留官方基线快照供幂等验证。
+
+若 manifest 记录了临时权限调整，恢复流程在 sealed 回滚基线就绪后才准备精确权限，并在恢复成功、恢复失败回滚或预提交异常时恢复记录的原 owner、DACL、继承标志和属性。安全恢复的最终状态要求文件内容、用户配置和安全描述符同时通过验证。
 
 ## 5. 五项侧栏翻译
 
@@ -223,9 +246,14 @@ WindowsApps 下只对 mutation plan 中已存在的目标文件以及需要创�
 
 - 不使用针对整个 resources 的 `takeown /r`；
 - 不使用针对整个 resources 的 `icacls /t`；
+- baseline 封存前只读取并记录原 security descriptor，不改变 ACL/owner；
+- baseline 封存后才允许对封闭计划中的单个目标临时取得写权限；
+- 对目标文件或为新文件准备的父目录逐个保存和还原 owner、DACL、继承标志与属性；
 - 命令采用单目标短超时；
 - `TimeoutExpired` 单独处理，随后实际探测目标是否可写；
-- 实际可写则继续，不可写则在首个补丁写入前失败；
+- 实际可写则继续；任一目标失败时先恢复此前调整的全部 security descriptor，再在首个内容写入前失败；
+- 补丁成功也必须还原临时权限，不能把 takeown 结果永久留给用户或 Administrators；
+- security descriptor 恢复失败按事务回滚失败处理，界面必须列出受影响目标，不能显示成功；
 - 错误返回具体路径、命令阶段和系统信息。
 
 普通本地安装和测试目录不运行 WindowsApps ACL 命令。
@@ -260,7 +288,7 @@ GUI 将这些状态映射为“已准备 / 待生成 / 不兼容 / 已损坏”�
 | 6 | 相对 resources 保存完整路径 | v1/v2 同名文件分别精确还原 |
 | 7 | manifest 保存配置键存在性与原值 | 缺失、字符串、null、自定义字体均原样恢复 |
 | 8 | backup 返回布尔并成为写入门禁 | 模拟复制失败时目标哈希不变、安装失败 |
-| 9 | 精确目标权限预检一次 | 无 resources `/r`、`/t`，失败发生于零写入阶段 |
+| 9 | 精确权限事务与 security descriptor 还原 | 无 resources `/r`、`/t`；权限/补丁失败及成功后 owner/DACL 均与原值一致 |
 | 10 | 忙碌时拒绝退出 + 原子写 | close 非阻塞但进程继续；replace 失败时原文件完整 |
 | 11 | 当前安装专属备份状态 | 空目录、陈旧 app、错版本、缺文件、错哈希均非 ready |
 | 五项 | 精确消息 ID + 旧版规则 + 侧栏上下文兜底 | 真实 ID 目录与新版 bundle 夹具得到五项目标文案 |
@@ -281,7 +309,7 @@ GUI 将这些状态映射为“已准备 / 待生成 / 不兼容 / 已损坏”�
 10. 原子写异常与临时文件清理；
 11. 五项 React-Intl ID、旧版结构及 DOM 上下文规则；
 12. `artifactLabel`、防误替换与反向恢复；
-13. 权限调用范围、超时与实际可写复核；
+13. 权限调用范围、超时、部分权限失败、补丁失败与成功后的 owner/DACL/继承/属性还原；
 14. GUI 安装后重检和忙碌关闭行为；
 15. 完整隔离 patch → detect → restore 字节级往返；
 16. PyInstaller 正式构建、打包源码一致性、Qt DLL、GUI 冒烟和 SHA-256。
