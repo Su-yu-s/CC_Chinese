@@ -1,9 +1,9 @@
-"""用 PyInstaller 打包为 onedir 目录模式(稳妥,规避 onefile 的临时目录/UAC 校验 bug)。
+"""用 PyInstaller 打包为 onedir 目录模式，并在启动时请求管理员权限。
 
 用法(用装有 PySide6 的 Python 3.13 环境):
     python -m pip install -r requirements.txt pyinstaller
     python build.py
-产物: dist/CC_Chinese/CC_Chinese.exe(约 15-20MB,双击自动请求管理员权限)
+产物: dist/CC_Chinese/CC_Chinese.exe（双击后立即请求管理员权限）
 
 --upx-dir 指向 scripts/upx/UPX(若未装可跑 scripts/install_upx.py 下载)。
 """
@@ -43,6 +43,8 @@ else:
         "--upx-exclude=libEGL.dll",
         "--upx-exclude=d3dcompiler_47.dll",
         "--upx-exclude=QtWebEngineProcess.exe",
+        "--upx-exclude=_uuid.pyd",
+        "--upx-exclude=python3.dll",
     ]
 
 PyInstaller.__main__.run([
@@ -50,11 +52,20 @@ PyInstaller.__main__.run([
     "--windowed",
     "--name=CC_Chinese",
     "--icon=assets/icon.ico",
-    "--add-data=core;core",
+    "--uac-admin",
+    # Python modules are already collected into PYZ through --paths=core.
+    # Only runtime JSON assets must remain as external data; copying all of
+    # core/ would also ship stale __pycache__ files from the build machine.
+    "--add-data=core/resources;core/resources",
     "--add-data=assets;assets",
     "--paths=core",          # 让 PyInstaller 解析 core/ 里的顶层 import
-    "--uac-admin",          # 写入 WindowsApps 需要管理员
     "--clean",
     "--noconfirm",
     *upx_dir_arg,
 ])
+
+# Refresh only this rebuilt executable's shell item (no global icon-cache purge).
+if sys.platform == "win32":
+    import ctypes
+    output_exe = Path(__file__).resolve().parent / "dist" / "CC_Chinese" / "CC_Chinese.exe"
+    ctypes.windll.shell32.SHChangeNotify(0x00002000, 0x0005, ctypes.c_wchar_p(str(output_exe)), None)

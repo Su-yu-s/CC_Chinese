@@ -1,114 +1,100 @@
-# CC_Chinese — Claude Desktop 中文助手
+# CC_Chinese
 
-给 Windows 版 Claude Desktop 打 zh-CN 中文本地化补丁的用户级桌面工具。
+为 Windows 版 Claude Desktop 提供中文界面补丁。工具只修改本机界面资源，不读取聊天、项目或工作区内容。
 
----
+> 本项目不是 Anthropic 官方产品。Claude Desktop 更新后资源结构可能变化；未通过兼容性检查的版本不会被修改。
 
-## 项目背景
+## 普通用户
 
-本项目基于 [Jyy1529/claude-desktop_win-zh_cn](https://github.com/Jyy1529/claude-desktop_win-zh_cn) 二次开发，
-原作者为 **Jyy1529（Jash）**。
+1. 可以运行 `CC_Chinese_Setup.exe` 安装，也可以直接使用 `dist/CC_Chinese/CC_Chinese.exe` 免安装版。
+2. 双击 `CC_Chinese` 后会立即请求管理员授权；安装版和免安装版功能一致。
+3. 点击“一键汉化”。
+4. 操作结束后工具会重新读取真实文件；只有资源、运行时标记和 locale 全部通过校验才显示“已汉化”。
 
-原版项目以 PowerShell 脚本 + Tauri 桌面壳的方式提供汉化补丁，功能完整但依赖较多、打包体积大。
-CC_Chinese 在此基础上重新设计了用户交互层：采用 PySide6 构建独立桌面 GUI，
-将补丁逻辑封装为可导入的 Python 模块，并通过 PyInstaller 打包为单个可执行文件，开箱即用。
+如需撤销，请在卸载助手前点击“恢复原样”。恢复只接受与当前 Claude 安装严格匹配、文件哈希完整的安全快照；不会拿旧版本备份覆盖新版本。
 
-**原项目地址：** [Jyy1529/claude-desktop_win-zh_cn](https://github.com/Jyy1529/claude-desktop_win-zh_cn)
+卸载助手不会自动修改 Claude，也不会删除保留在本机的安全快照。
 
----
+## 当前能力
 
-## 功能
+- 自动定位 WindowsApps 与 AppData 本地安装版 Claude Desktop
+- 资源结构兼容性门控；未知版本停止写入
+- 强制创建版本绑定的完整快照，备份失败即停止
+- JSON、JS chunk 与配置文件原子写入
+- 写入失败自动回滚；恢复失败回到恢复前状态
+- locale/font 原值精确还原
+- 五项侧边栏翻译：新建、项目、作品、定时、定制
+- 失败详情复制与本地脱敏日志（最多 5 个文件，每个 2 MiB）
+- WindowsApps 精确目标权限处理，不递归接管整个 `resources`
 
-- 自动检测 WindowsApps 和 AppData 版 Claude Desktop 安装目录
-- 手动选择 Claude `app` 目录（检测失败时）
-- <img width="552" height="618" alt="3b40ef32196048168ffbad116f3d9111" src="https://github.com/user-attachments/assets/d7221228-d838-4fe4-87ee-d7934508a4bc" />
-- 一键安装中文补丁（JSON 资源 + JS chunk 硬编码文案）
-- <img width="550" height="618" alt="QQ_1787917105456" src="https://github.com/user-attachments/assets/566357a0-1018-4622-83c4-369afd352fe4" />
-- 一键恢复官方英文文件
-- 后台执行补丁，前台显示进度与实时日志，窗口可自由拖拽
-- 单实例锁防多开，PyInstaller onedir 打包避免临时目录问题
+## 兼容性说明
 
----
+工具不靠版本号猜测支持情况，而是核对关键资源、消息 ID、入口 bundle 数量和运行时标记。检测到未知布局时会提示“尚未适配”，不会尝试碰运气写入。
 
-## 技术栈
+当前代码已在 Claude Desktop `1.40609.1.0` 的已安装资源布局上完成只读兼容性验证。后续版本是否可用以工具内实际检测结果为准。
 
-- **Python 3.13** + **PySide6**（Qt 官方维护，LGPL 授权，可闭源分发）
-- 原生无边框窗口 + QPainter 自绘（靶心图标 / 脉冲点 / 进度条）+ QSS 皮肤
-- 后台 `QThread` 运行补丁，进度通过 Signal 回主线程，不冻结界面
-- PyInstaller onedir 打包（约 97MB）
+## 出问题怎么办
 
----
+- 先完全关闭 Claude 后重试。
+- 操作失败时点击“复制详情”或“打开日志目录”。日志只记录版本、错误码等允许字段，不记录聊天正文、令牌和用户绝对路径。
+- 如果 Claude 已被其他补丁修改，工具会拒绝创建“官方基线”；请先使用 Claude 官方修复/重装，再运行助手。
+- 反馈地址：[GitHub Issues](https://github.com/Su-yu-s/CC_Chinese/issues)
 
-## 快速开始
+## 开发与构建
 
-```bash
-# 安装依赖
-pip install -r requirements.txt
+要求 Python 3.13、PySide6、PyInstaller。项目不会在构建时自动安装或更换你的环境。
 
-# 运行（需 Python 3.13 + PySide6）
-python main.py
+```powershell
+py -3.13 -m pip install -r requirements.txt pyinstaller
+py -3.13 build.py
 ```
 
-### 打包
+onedir 产物：`dist/CC_Chinese/CC_Chinese.exe`
 
-```bash
-pip install pyinstaller
-python build.py
-# 产物：dist/CC_Chinese/CC_Chinese.exe
+安装包（需要 Inno Setup 6）：
+
+```powershell
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" CC_Chinese.iss
 ```
 
-### 测试
+安装包产物：`release/CC_Chinese_Setup.exe`
 
-```bash
-python tests/test_patch_logic.py       # 汉化逻辑（临时假环境，不碰真实系统）
-QT_QPA_PLATFORM=offscreen python tests/gui_smoke.py
+主要隔离测试：
+
+```powershell
+py -3.13 tests/test_backup_manifest.py
+py -3.13 tests/test_compatibility.py
+py -3.13 tests/test_translation_repairs.py
+py -3.13 tests/verify_patch_restore.py
+py -3.13 tests/test_installer_transaction.py
+$env:QT_QPA_PLATFORM = "offscreen"
+py -3.13 tests/test_freeze_guards.py
 ```
-
----
 
 ## 项目结构
 
-```
-main.py               入口：UI + 状态机 + Worker + 单实例锁
-core/
-  detector.py         检测安装目录 / 版本 / 汉化状态
-  patch_json.py       run_patch: 写 zh-CN 资源 + 白名单 + locale
-  patch_chunks.py     run_patch_chunks: chunk 文案 + 字体/会话增强运行时
-  restore.py          run_restore: 从备份还原官方文件
-  installer.py        编排 run_install / run_restore / run_open / check_update
-  best_effort_io.py   权限检测 + WindowsApps 提权 + 容错写入
-  resources/
-    desktop-zh-CN.json
-    frontend-zh-CN.json
-    statsig-zh-CN.json
-assets/icon.ico       窗口图标（黑底白弧靶心）
-build.py              PyInstaller onedir 打包脚本
-CC_Chinese.spec       PyInstaller 配置
-requirements.txt      运行依赖
+```text
+main.py                  GUI、状态机、管理员主进程入口
+core/detector.py         安装定位与真实状态检测
+core/compatibility.py    资源结构兼容性门控
+core/backup_manifest.py  版本绑定快照与 manifest
+core/safe_io.py          原子文件写入
+core/best_effort_io.py   精确权限事务
+core/installer.py        汉化/恢复事务编排与回滚
+core/patch_json.py       JSON、locale 与白名单补丁
+core/patch_chunks.py     chunk 翻译及运行时增强
+core/restore.py          严格快照恢复命令入口
+core/diagnostics.py      本地脱敏诊断
+core/elevation.py        管理员校验与安全快照目录初始化
 ```
 
----
+## 风险与边界
 
-## 状态机
-
-```
-待汉化 ──→ 汉化中（瞬态，打补丁时）──→ 已汉化
-   ↑                                  │
-   └──────────── 恢复 ─────────────────┘
-未找到安装目录时禁用主按钮，通过「设置」手动指定路径
-```
-
----
-
-## 风险提示
-
-- 本项目会修改本机已安装的 Claude Desktop 资源文件，请确认接受本地补丁与备份恢复的风险。
-- 不建议在公司受管设备上绕过组织策略使用。
-- Claude Desktop 更新后，补丁可能失效，需重新运行安装。
-
----
+- 本工具会修改 Claude Desktop 的本地安装资源，可能不适用于受组织管理的设备。
+- 请自行确认这种本地修改与适用于你的服务条款及组织政策的关系。
+- 无代码签名的自构建安装包可能触发 SmartScreen；正式分发前建议使用可信代码签名证书。
+- 当前版本不提供联网更新、后台监控或遥测；界面中也不会展示对应的假功能。这些能力属于后续路线图。
 
 ## 致谢
 
-感谢原作者 **Jyy1529（Jash）** 的 [claude-desktop_win-zh_cn](https://github.com/Jyy1529/claude-desktop_win-zh_cn) 项目，
-本项目的核心汉化逻辑（JSON 资源、chunk 补丁、restore 备份）均来源于原版。
+项目基于 [Jyy1529/claude-desktop_win-zh_cn](https://github.com/Jyy1529/claude-desktop_win-zh_cn) 的汉化思路继续开发，感谢原作者 Jyy1529（Jash）。

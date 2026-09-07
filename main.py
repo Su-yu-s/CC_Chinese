@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""CC_Chinese — Claude Desktop 中文助手（PySide6 版，按 CC_Chinese 设计规范）。
+"""CC_Chinese（PySide6 版，按 CC_Chinese 设计规范）。
 
-界面：无边框 380×500 黑白灰窗口（QStackedWidget 主界面/设置页）；补丁逻辑全在 core/。
+界面：无边框 380×420 黑白灰窗口（QStackedWidget 主界面/设置页）；补丁逻辑全在 core/。
 本文件只做界面 + 交互 + 状态展示。core/ 通过 sys.path 顶层名 import，避免改动补丁脚本。
 补丁在后台 QThread 运行（Worker 集合保活防闪退），单实例锁防多开。
 """
 from __future__ import annotations
 
-import ctypes
 import math
 import os
-import subprocess
 import sys
 from pathlib import Path
+
+# 提权后子进程的工作目录是 exe 所在目录，不在项目根目录。
+# 确保 core/ 在任何 import 之前可被找到。
+_PROJECT_ROOT = Path(__file__).resolve().parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPoint, QPointF, QRectF, QSettings, QSharedMemory, QThread, Qt, QTimer, QUrl, Signal
@@ -37,10 +41,11 @@ if CORE_DIR not in sys.path:
 import detector  # noqa: E402
 import installer  # noqa: E402
 from best_effort_io import is_windows_admin, is_windowsapps_path  # noqa: E402
+import diagnostics as diag  # noqa: E402
 
 APP_ID = "cc-chinese-pyqt"
 APP_NAME = "CC_Chinese"
-SUB_NAME = "Claude Desktop 中文助手"
+SUB_NAME = APP_NAME
 VERSION = "v1.0.0"
 AUTHOR = "苏"
 GITHUB_URL = "https://github.com/Su-yu-s/CC_Chinese"
@@ -68,16 +73,6 @@ STATE_BUTTON = {"待汉化": "一键汉化", "汉化中": "处理中...", "恢�
 STATE_ENABLED = {"待汉化": True, "汉化中": False, "恢复中": False, "已汉化": True, "未找到": False, "检测中": False}
 
 _GUARD = None  # 单实例锁
-
-
-def relaunch_elevated() -> None:
-    """以管理员身份重启自身（写入 WindowsApps 需要）。frozen 时直接重启 exe。"""
-    argline = "" if getattr(sys, "frozen", False) else subprocess.list2cmdline(sys.argv)
-    try:
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, argline, os.getcwd(), 1)
-    except Exception:
-        pass
-
 
 class Worker(QThread):
     """后台线程跑 installer 一个入口，进度经信号回主线程。"""
@@ -186,7 +181,7 @@ class TargetIcon(QWidget):
 
 
 class PulseDot(QWidget):
-    """Pill 标签里的橙色脉冲点：透明度 100→35→100，周期 2.5s。"""
+    """状态色圆点：处理中脉冲，稳定状态不透明且不启动动画。"""
 
     def __init__(self, parent=None, color: str | None = None):
         super().__init__(parent)
@@ -204,9 +199,11 @@ class PulseDot(QWidget):
         if active != self._active:
             self._active = active
             self._apply_timer()
+            self.update()
 
     def set_color(self, color: str) -> None:
         self._color = QColor(color)
+        self.update()
 
     def showEvent(self, e):  # noqa: N802
         super().showEvent(e)
@@ -230,7 +227,7 @@ class PulseDot(QWidget):
         v = self._phase / 2500.0
         frac = 0.675 - 0.325 * math.cos(2 * math.pi * v)
         col = QColor(self._color)
-        col.setAlpha(int(255 * frac))
+        col.setAlpha(int(255 * frac) if self._active else 255)
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setPen(Qt.NoPen)
@@ -266,15 +263,14 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self._settings = QSettings("CC_Chinese", "CC_Chinese")
-        self._auto_backup = self._settings.value("auto_backup", True, type=bool)
         self._auto_detect = self._settings.value("auto_detect", True, type=bool)
-        self._update_channel = self._settings.value("update_channel", "stable")
         self._target = self._settings.value("target", "auto")
         self._manual_dir = ""
         self._worker = None
         self._workers = set()   # 保活正在运行的 QThread，防止被 GC 提前析构导致闪退
         self._detect_seq = 0    # 检测序号：只采纳最新一次检测结果，防止旧 worker 覆盖新状态
         self._busy = False
+        self._closing = False
         self._detecting = True
         self._state = "检测中"
         self._status = {}
@@ -298,7 +294,7 @@ class MainWindow(QWidget):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window | Qt.WindowType.WindowMinimizeButtonHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         try:
-            self.setWindowIcon(QtGui.QIcon(os.path.join(CORE_DIR, "..", "assets", "icon.ico")))
+            self.setWindowIcon(QtGui.QIcon(os.path.join(ASSETS_DIR, "icon.ico")))
         except Exception:
             pass
 
@@ -326,6 +322,17 @@ class MainWindow(QWidget):
         # Toast overlay
         self._toast = Toast(self)
         self._apply_state()
+
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        if sys.platform == "win32" and QtWidgets.QApplication.platformName() == "windows":
+            # The custom titlebar logo is a QLabel, not the taskbar icon.
+            # Apply HICONs after Qt has created its frameless native window.
+            from window_icon import apply_window_icon
+            try:
+                apply_window_icon(int(self.winId()), Path(ASSETS_DIR) / "icon.ico")
+            except OSError as exc:
+                self._native_icon_error = str(exc)
 
     def _build_main_page(self) -> QWidget:
         page = QWidget()
@@ -358,8 +365,7 @@ class MainWindow(QWidget):
         bl.addSpacing(24)
         row = QHBoxLayout()
         row.setSpacing(4)
-        for text, handler in (("检查更新", lambda: self._run("check_update")),
-                              ("恢复原样", self._confirm_restore),
+        for text, handler in (("恢复原样", self._confirm_restore),
                               ("设置", self._go_settings)):
             b = QPushButton(text)
             b.setObjectName("secondary")
@@ -485,7 +491,7 @@ class MainWindow(QWidget):
         self._target_select = _WheelCombo()
         self._target_select.addItem("自动检测", "auto")
         self._target_select.addItem("WindowsApps 商店版", "windows-apps")
-        self._target_select.addItem("AppData 网页版", "app-data")
+        self._target_select.addItem("AppData 本地安装版", "app-data")
         self._target_select.addItem("手动指定目录", "manual")
         idx = self._target_select.findData(self._target)
         if idx >= 0:
@@ -504,31 +510,11 @@ class MainWindow(QWidget):
         self._browse_btn = browse
         bv.addWidget(browse)
         bv.addSpacing(32)
-        # 汉化选项
-        bv.addWidget(self._group_label("汉化选项"))
-        bv.addSpacing(8)
-        self._backup_check = self._opt_row(bv, "汉化前自动备份原文件", self._auto_backup)
-        self._backup_check.toggled.connect(self._on_backup_toggled)
-        bv.addSpacing(32)
         # 通用
         bv.addWidget(self._group_label("通用"))
         bv.addSpacing(8)
         self._detect_check = self._opt_row(bv, "启动时自动检测 Claude", self._auto_detect)
         self._detect_check.toggled.connect(self._on_detect_toggled)
-        bv.addSpacing(12)
-        chan_label = QLabel("更新通道")
-        chan_label.setObjectName("subheading")
-        bv.addWidget(chan_label)
-        bv.addSpacing(8)
-        self._channel_select = _WheelCombo()
-        self._channel_select.addItem("稳定版", "stable")
-        self._channel_select.addItem("预览版", "beta")
-        cidx = self._channel_select.findData(self._update_channel)
-        if cidx >= 0:
-            self._channel_select.setCurrentIndex(cidx)
-        self._channel_select.currentIndexChanged.connect(
-            lambda i: self._settings.setValue("update_channel", self._channel_select.itemData(i)))
-        bv.addWidget(self._channel_select)
         bv.addSpacing(32)
         # 关于
         bv.addWidget(self._group_label("关于"))
@@ -685,17 +671,32 @@ class MainWindow(QWidget):
         self._workers.add(w)
         w.progress.connect(self._on_progress)
         w.done.connect(done_cb)
-        w.finished.connect(lambda: self._workers.discard(w))
+        w.finished.connect(lambda: self._on_worker_finished(w))
         w.start()
         self._worker = w
 
+    def _on_worker_finished(self, worker) -> None:
+        self._workers.discard(worker)
+        if self._worker is worker:
+            self._worker = None
+        if self._closing and not any(item.isRunning() for item in self._workers):
+            QTimer.singleShot(0, self.close)
+
     def closeEvent(self, event):  # noqa: N802
-        # ponytail: 不在 GUI 线程 wait(2000)。worker 里的 subprocess(timeout=…) 自己会退出，
-        # QThread 不参与 Python 多线程，进程退出也不会因未 wait 而挂住；requestInterruption
-        # 只是提示，避免「关闭窗口被阻塞最久 2s/个」。
-        for w in list(self._workers):
-            if w.isRunning():
-                w.requestInterruption()
+        if self._busy:
+            event.ignore()
+            return
+        running = [worker for worker in self._workers if worker.isRunning()]
+        if running:
+            # Do not block the GUI thread and do not destroy live QThreads.
+            # Detection has bounded subprocess timeouts; hide immediately and
+            # close for real when the final worker emits finished.
+            self._closing = True
+            self.hide()
+            for worker in running:
+                worker.requestInterruption()
+            event.ignore()
+            return
         super().closeEvent(event)
 
     # ---- 检测 ----
@@ -748,7 +749,7 @@ class MainWindow(QWidget):
     def _confirm_restore(self):
         msg = QtWidgets.QMessageBox(self)
         msg.setWindowTitle("恢复原样")
-        msg.setText("撤销中文补丁、恢复官方资源与 locale 设置？不会删除 Claude 数据。")
+        msg.setText("从匹配的安全快照恢复官方资源，并还原汉化前的 locale/font 原值？不会删除 Claude 数据。")
         msg.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
         msg.setDefaultButton(QtWidgets.QMessageBox.StandardButton.No)
         if msg.exec() == QtWidgets.QMessageBox.StandardButton.Yes:
@@ -758,20 +759,26 @@ class MainWindow(QWidget):
         if self._busy:
             return
         app_dir = self._status.get("appDir")
-        if command == "install" and app_dir and is_windowsapps_path(Path(app_dir)) and not is_windows_admin():
-            # 写 WindowsApps 需管理员：自动以管理员重启
-            self._release_instance()
-            relaunch_elevated()
-            QtWidgets.QApplication.instance().quit()
-            return
         if command == "install":
-            fn = lambda a, progress_cb=None: installer.run_install(a, progress_cb, backup=self._auto_backup)
+            fn = installer.run_install
         else:
             fn = {"restore": installer.run_restore,
-                  "open": installer.run_open,
-                  "check_update": installer.check_update}.get(command)
+                  "open": installer.run_open}.get(command)
         if fn is None:
             return
+        if command in {"install", "restore"} and app_dir and is_windowsapps_path(Path(app_dir)):
+            operation = fn
+            if is_windows_admin():
+                fn = lambda target, progress_cb=None: operation(
+                    target, progress_cb=progress_cb, elevated=True
+                )
+            else:
+                fn = lambda _target, progress_cb=None: {
+                    "success": False,
+                    "state": "error",
+                    "error_code": "PERMISSION_DENIED",
+                    "message": "请以管理员身份重新启动 CC_Chinese。",
+                }
         self._busy = True
         self._last_command = command
         self._busy_state = "恢复中" if command == "restore" else "汉化中"
@@ -786,21 +793,36 @@ class MainWindow(QWidget):
     def _on_action_done(self, result):
         self._busy = False
         self._progress.setVisible(False)
-        self._toast.show_message(result.get("message", "完成"))
-        # 汉化成功:文件已写入,立即反映为"已汉化"(立即重检可能因竞态误报待汉化)
-        # 恢复成功/其他:重检(zh 文件已删,应为待汉化)
-        if result.get("success") and getattr(self, "_last_command", None) == "install":
-            self._status["localized"] = True
-            self._status["state"] = "ready"
-            self._set_state("已汉化")
+        if result.get("success"):
+            self._toast.show_message(result.get("message", "完成"))
         else:
-            self._refresh_status()
+            # 失败时写脱敏诊断日志，并展示可复制详情
+            context = {"target_id": str(self._status.get("appDir", ""))}
+            extra_context = result.get("diagnostic_context")
+            if isinstance(extra_context, dict):
+                context.update(extra_context)
+            report = diag.DiagnosticLogger().record_failure(
+                action=self._last_command or "unknown",
+                result=result,
+                context=context,
+            )
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("操作失败")
+            box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+            box.setText(f"{result.get('message', '未知错误')}\n\n{report.advice}")
+            copy_button = box.addButton("复制详情", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+            log_button = box.addButton("打开日志目录", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+            box.addButton(QtWidgets.QMessageBox.StandardButton.Close)
+            box.exec()
+            if box.clickedButton() is copy_button:
+                QtWidgets.QApplication.clipboard().setText(report.copy_text())
+                self._toast.show_message("已复制故障详情")
+            elif box.clickedButton() is log_button:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(report.log_path.parent)))
+        # 每次操作完成后都重新检测真实文件状态，不使用结果文件或退出码乐观显示成功
+        self._refresh_status()
 
     # ---- 设置项回调 ----
-    def _on_backup_toggled(self, checked):
-        self._auto_backup = checked
-        self._settings.setValue("auto_backup", checked)
-
     def _on_detect_toggled(self, checked):
         self._auto_detect = checked
         self._settings.setValue("auto_detect", checked)
@@ -821,7 +843,6 @@ class MainWindow(QWidget):
             self._manual_input.setText(chosen)
             self._manual_dir = chosen
             self._refresh_status()
-
 
 class Toast(QFrame):
     def __init__(self, parent):
@@ -910,10 +931,75 @@ def _release_instance():
             pass
 
 
+def _handle_elevation_cli(argv: list[str]) -> int | None:
+    """Parse elevation-broker CLI flags and run the action directly; returns None to fall through to GUI."""
+    action = target_hint = nonce = None
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--elevated-action" and i + 1 < len(argv):
+            action = argv[i + 1]
+            i += 2
+        elif argv[i] == "--target-hint" and i + 1 < len(argv):
+            target_hint = argv[i + 1]
+            i += 2
+        elif argv[i] == "--nonce" and i + 1 < len(argv):
+            nonce = argv[i + 1]
+            i += 2
+        else:
+            i += 1
+    if action and target_hint and nonce:
+        import elevation as _e
+        return _e.run_elevated_action(action, target_hint, nonce)
+    return None
+
+
+def _configure_application_icon(app):
+    icon = QtGui.QIcon(os.path.join(ASSETS_DIR, "icon.ico"))
+    # Decode before the first native window/taskbar button is created.
+    sizes = (16, 32, 48, 256)
+    decoded = all(not icon.pixmap(size, size).isNull() for size in sizes)
+    app.setWindowIcon(icon)
+    return decoded
+
+
+def _run_self_test(argv: list[str]) -> int | None:
+    """Read-only frozen-build smoke test used by the release pipeline."""
+    if "--self-test" not in argv:
+        return None
+    source_check = installer.patch_json.validate_source_resources()
+    native_icon_test = "--native-icon" in argv and sys.platform == "win32"
+    os.environ["QT_QPA_PLATFORM"] = "windows" if native_icon_test else "offscreen"
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([argv[0]])
+    if not source_check["success"] or not _configure_application_icon(app):
+        return 2
+    if native_icon_test:
+        from window_icon import apply_window_icon
+        # Native HWND, but never show this diagnostic window or modify Claude.
+        window = QtWidgets.QWidget()
+        try:
+            apply_window_icon(int(window.winId()), Path(ASSETS_DIR) / "icon.ico")
+        except OSError:
+            return 3
+        finally:
+            window.close()
+    return 0
+
+
 def main():
     global _GUARD
+    # 提权后进程：跳过 GUI，直接执行操作
+    result = _handle_elevation_cli(sys.argv)
+    if result is not None:
+        sys.exit(result)
+    self_test = _run_self_test(sys.argv)
+    if self_test is not None:
+        return self_test
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CC_Chinese.Desktop")
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    _configure_application_icon(app)
     app.setQuitOnLastWindowClosed(True)
     app.setStyleSheet(STYLESHEET)
 
@@ -932,4 +1018,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

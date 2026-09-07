@@ -16,10 +16,13 @@ import sys
 import time
 from pathlib import Path
 
+import backup_manifest
+from best_effort_io import is_windowsapps_path
+
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-BACKUP_ROOT = Path(os.environ.get("LOCALAPPDATA", "")) / "Claude-zh-CN-official-backup"
-PATCH_STATE_PATH = BACKUP_ROOT / "json-only" / "patch-state.json"
+_APP_DIR_CACHE_TTL = 5.0
+_APP_DIR_CACHE: dict[str, tuple[float, Path]] = {}
 # Store 版 Claude 的包族名（AppX 启动兜底用）；权威值优先取 Get-AppxPackage 动态结果
 APPX_PFN = "Claude_pzs8sxrjxfjjc!Claude"
 # —— 自动定位 Claude 真正读取的主配置文件(不写死路径) ——
@@ -199,15 +202,35 @@ def resolve_app_dir(target: str | None = None, app_dir: str | None = None) -> Pa
             return path / "app"
         return None
 
-    windows = find_windowsapps_packages()
-    appdata = find_appdata_packages()
     choice = (target or "auto").lower()
-    if choice in {"windows-apps", "windowsapps"}:
-        return windows[0] if windows else None
-    if choice in {"app-data", "appdata"}:
-        return appdata[0] if appdata else None
     if choice == "manual":
         return None
+
+    cached = _APP_DIR_CACHE.get(choice)
+    if cached is not None:
+        cached_at, cached_path = cached
+        if (
+            time.monotonic() - cached_at <= _APP_DIR_CACHE_TTL
+            and (cached_path / "resources" / "en-US.json").is_file()
+        ):
+            return cached_path
+        _APP_DIR_CACHE.pop(choice, None)
+
+    if choice in {"windows-apps", "windowsapps"}:
+        windows = find_windowsapps_packages()
+        resolved = windows[0] if windows else None
+        if resolved is not None:
+            _APP_DIR_CACHE[choice] = (time.monotonic(), resolved)
+        return resolved
+    if choice in {"app-data", "appdata"}:
+        appdata = find_appdata_packages()
+        resolved = appdata[0] if appdata else None
+        if resolved is not None:
+            _APP_DIR_CACHE[choice] = (time.monotonic(), resolved)
+        return resolved
+
+    windows = find_windowsapps_packages()
+    appdata = find_appdata_packages()
 
     # "auto": prefer the running Claude process, then store, then user edition
     try:
@@ -227,23 +250,29 @@ def resolve_app_dir(target: str | None = None, app_dir: str | None = None) -> Pa
         for line in result.stdout.splitlines():
             parent = Path(line.strip())
             if (parent / "resources" / "en-US.json").is_file():
+                _APP_DIR_CACHE[choice] = (time.monotonic(), parent)
                 return parent
             if (parent / "app" / "resources" / "en-US.json").is_file():
-                return parent / "app"
+                resolved = parent / "app"
+                _APP_DIR_CACHE[choice] = (time.monotonic(), resolved)
+                return resolved
     except Exception:
         pass
 
-    if windows:
-        return windows[0]
-    if appdata:
-        return appdata[0]
-    return None
+    resolved = windows[0] if windows else (appdata[0] if appdata else None)
+    if resolved is not None:
+        _APP_DIR_CACHE[choice] = (time.monotonic(), resolved)
+    return resolved
 
 
-def has_backup() -> bool:
-    if not BACKUP_ROOT.exists():
+def has_backup(app_dir: Path | None = None) -> bool:
+    """Only a matching, complete, hash-verified snapshot is "ready"."""
+    if app_dir is None:
         return False
-    return any(BACKUP_ROOT.rglob("*"))
+    try:
+        return backup_manifest.backup_status(Path(app_dir))["status"] == "ready"
+    except (OSError, ValueError, backup_manifest.ManifestError):
+        return False
 
 
 def locale_is_zh() -> bool:
@@ -256,12 +285,24 @@ def locale_is_zh() -> bool:
     return data.get("locale") == "zh-CN"
 
 
-# patch_chunks 注入的运行时标记：官方 bundle 绝不包含，是“已打补丁”的可靠指纹。
+# patch_chunks 注入的补丁指纹标记：官方 bundle 绝不包含，是“已打补丁”的可靠指纹。
 # 不能用“bundle 文本含 zh-CN”判断——官方语言列表数组天然含 zh-CN，必然误报。
 CHUNK_PATCH_MARKERS = (
+    "__CLAUDE_ZH_CN_PATCH_BEGIN__",
+)
+# 旧版功能运行时（字体/会话）注入的标记对：旧版补丁的安装凭它们识别“已打补丁”。
+LEGACY_CHUNK_PATCH_MARKERS = (
     "__CLAUDE_ZH_CN_FONT_PATCH_BEGIN__",
     "__CLAUDE_ZH_CN_SESSION_DELETE_PATCH_BEGIN__",
 )
+_MARKER_BYTES = tuple(marker.encode("ascii") for marker in CHUNK_PATCH_MARKERS)
+_LEGACY_MARKER_BYTES = tuple(marker.encode("ascii") for marker in LEGACY_CHUNK_PATCH_MARKERS)
+# 注入块追加/原位替换在入口 bundle 尾部附近；检测只读文件尾部，避免每次
+# 状态检测都整读数百 MB 的 bundle。
+_MARKER_TAIL_BYTES = 4 * 1024 * 1024
+# 检测可能被同一进程反复调用（每次操作后都会刷新状态）。以每个入口
+# bundle 的 (路径, mtime, size) 为键缓存结果，文件未变则直接复用。
+_WHITELIST_MARKER_CACHE: dict[tuple, bool] = {}
 
 
 def file_has_chunk_marker(path: Path) -> bool:
@@ -269,42 +310,59 @@ def file_has_chunk_marker(path: Path) -> bool:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return False
-    return any(marker in text for marker in CHUNK_PATCH_MARKERS)
+    if any(marker in text for marker in CHUNK_PATCH_MARKERS):
+        return True
+    return all(marker in text for marker in LEGACY_CHUNK_PATCH_MARKERS)
 
 
 def same_app_dir(left: Path, right: Path) -> bool:
     return os.path.normcase(os.path.abspath(str(left))) == os.path.normcase(os.path.abspath(str(right)))
 
 
+def _tail_has_markers(path: Path) -> bool:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > _MARKER_TAIL_BYTES:
+                handle.seek(-_MARKER_TAIL_BYTES, os.SEEK_END)
+            data = handle.read()
+    except OSError:
+        return False
+    if all(marker in data for marker in _MARKER_BYTES):
+        return True
+    return all(marker in data for marker in _LEGACY_MARKER_BYTES)
+
+
 def whitelist_has_zh(app_dir: Path) -> bool:
     """判断当前安装目录是否已打中文补丁。
 
-    依据补丁指纹：patch-state 记录匹配当前目录，或 bundle 里有 chunk
-    运行时标记（官方文件绝不含）。
+    只依据 bundle 运行时标记；patch-state 是工具缓存，不能作为事实来源。
+    入口 bundle 可能各有数百 MB，因此按文件指纹缓存结果，且只读尾部。
     """
     resources = app_dir / "resources"
     assets = resources / "ion-dist" / "assets"
     if not assets.exists():
         return False
 
-    if PATCH_STATE_PATH.is_file():
+    paths: list[Path] = []
+    key_parts: list[tuple] = []
+    for path in sorted(assets.rglob("index-*.js"), key=lambda item: item.as_posix().lower()):
         try:
-            state = json.loads(PATCH_STATE_PATH.read_text(encoding="utf-8"))
-            state_app_dir = Path(state.get("app_dir", ""))
-            whitelist_files = state.get("whitelist_files", [])
-            if same_app_dir(state_app_dir, app_dir) and isinstance(whitelist_files, list):
-                if any(
-                    isinstance(relative, str) and (resources / relative).is_file()
-                    for relative in whitelist_files
-                ):
-                    return True
-        except (OSError, ValueError, TypeError):
-            pass
-
-    for path in assets.rglob("index-*.js"):
-        if file_has_chunk_marker(path):
-            return True
-    return False
+            stat_result = path.stat()
+        except OSError:
+            continue
+        paths.append(path)
+        key_parts.append((os.path.normcase(str(path)), stat_result.st_mtime_ns, stat_result.st_size))
+    if not paths:
+        return False
+    cache_key = tuple(key_parts)
+    cached = _WHITELIST_MARKER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    result = any(_tail_has_markers(path) for path in paths)
+    _WHITELIST_MARKER_CACHE.clear()
+    _WHITELIST_MARKER_CACHE[cache_key] = result
+    return result
 
 
 def zh_resources_present(app_dir: Path) -> bool:
@@ -312,17 +370,20 @@ def zh_resources_present(app_dir: Path) -> bool:
     targets = [
         resources / "zh-CN.json",
         resources / "ion-dist" / "i18n" / "zh-CN.json",
-        resources / "ion-dist" / "i18n" / "statsig" / "zh-CN.json",
     ]
+    # Microsoft Store can lock this auxiliary directory independently.  The
+    # primary locale files are sufficient for the visible application UI and
+    # are the same files verified by the installer for protected packages.
+    if not is_windowsapps_path(app_dir):
+        targets.append(resources / "ion-dist" / "i18n" / "statsig" / "zh-CN.json")
     return all(path.is_file() for path in targets)
 
 
 def python_available() -> bool:
-    try:
-        result = run_capture([python_exe(), "--version"], timeout=5)
-        return result.returncode == 0
-    except Exception:
-        return False
+    # Source mode is already running inside Python; frozen mode bundles the
+    # runtime. Spawning sys.executable is both redundant and wrong when it is
+    # CC_Chinese.exe, because that launches another GUI instance.
+    return Path(python_exe()).is_file()
 
 
 def powershell_available() -> bool:
@@ -331,6 +392,7 @@ def powershell_available() -> bool:
 
 def build_status(target: str | None = None, app_dir: str | None = None) -> dict:
     resolved = resolve_app_dir(target=target, app_dir=app_dir)
+    powershell_ready = powershell_available()
     installed = resolved is not None
     localized = False
     language = "未安装"
@@ -343,13 +405,13 @@ def build_status(target: str | None = None, app_dir: str | None = None) -> dict:
         {"label": "语言白名单", "value": "未知", "tone": "warn"},
         {
             "label": "备份文件",
-            "value": "待生成" if not has_backup() else "已准备",
-            "tone": "good" if has_backup() else "warn",
+            "value": "待生成",
+            "tone": "warn",
         },
         {
-            "label": "Python / PowerShell",
-            "value": "可用" if python_available() and powershell_available() else "缺失",
-            "tone": "good" if python_available() and powershell_available() else "danger",
+            "label": "PowerShell",
+            "value": "可用" if powershell_ready else "缺失",
+            "tone": "good" if powershell_ready else "danger",
         },
     ]
 
@@ -361,8 +423,8 @@ def build_status(target: str | None = None, app_dir: str | None = None) -> dict:
         zh_files = zh_resources_present(resolved)
         whitelist = whitelist_has_zh(resolved)
         locale = locale_is_zh()
-        backup = has_backup()
-        localized = zh_files and whitelist
+        backup = has_backup(resolved)
+        localized = zh_files and whitelist and locale
         language = "zh-CN" if locale or localized else "未安装"
         checks[0] = {"label": "Claude Desktop", "value": "已安装", "tone": "good"}
         checks[1] = {
@@ -406,8 +468,33 @@ def build_status(target: str | None = None, app_dir: str | None = None) -> dict:
     }
 
 
-def stop_claude() -> None:
+def _claude_pids() -> list[int]:
     try:
+        result = run_capture(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-Process -Name claude -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id",
+            ],
+            timeout=6,
+        )
+    except Exception:
+        return []
+    return [int(line) for line in (result.stdout or "").splitlines() if line.strip().isdigit()]
+
+
+def stop_claude(timeout: float = 12.0) -> bool:
+    """停止 Claude Desktop 并确认进程真正退出。
+
+    Windows 上运行中的 Claude 会内存映射 ion-dist 下的 JS/JSON 资源，
+    文件句柄未释放时 os.replace 必然失败（WinError 5/32）。因此这里必须
+    “杀死后确认”，而不是发完 Stop-Process 就睡一个固定时长。
+    返回 True 表示已没有任何 claude 进程（或本来就没运行）。
+    """
+    try:
+        if not _claude_pids():
+            return True
         run_capture(
             [
                 "powershell",
@@ -420,9 +507,17 @@ def stop_claude() -> None:
             ],
             timeout=15,
         )
-        time.sleep(1.5)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not _claude_pids():
+                return True
+            time.sleep(0.4)
+        # 兜底：taskkill 能结束整个进程树，且不依赖 PowerShell 管道行为。
+        run_capture(["taskkill", "/F", "/T", "/IM", "Claude.exe"], timeout=10)
+        time.sleep(0.5)
+        return not _claude_pids()
     except Exception:
-        pass
+        return False
 
 
 def _appx_candidates() -> list[str]:

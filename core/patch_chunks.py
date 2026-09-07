@@ -14,3263 +14,41 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from best_effort_io import ensure_admin_for_windowsapps, ensure_windowsapps_writable, print_permission_denied_hint
-from detector import resolve_claude_config
+from best_effort_io import ensure_admin_for_windowsapps, print_permission_denied_hint
+from safe_io import atomic_copy, atomic_write_text
 
 
 BACKUP_ROOT = Path(os.environ["LOCALAPPDATA"]) / "Claude-zh-CN-official-backup" / "chunks"
+STATE_ROOT = Path(os.environ["LOCALAPPDATA"]) / "CC_Chinese" / "state"
 CHUNK_STATE_NAME = "chunk-state.json"
 CHUNK_STATE_SCHEMA = 1
-CONFIG_PATH = resolve_claude_config()
-FONT_KEY = "claudeZhCnFont"
 
-MODE_LABEL_TRANSLATIONS = {
-    "Mode": "执行方式",
-    "Manual": "每次问我",
-    "Manual permissions": "每次问我",
-    "Ask permissions": "每次问我",
-    "Accept edits": "自动修改",
-    "Accept": "自动修改",
-    "Plan": "计划模式",
-    "Bypass permissions": "最高权限",
-    "Bypass": "最高权限",
-    "模式": "执行方式",
-    "手册": "每次问我",
-    "手动批准": "每次问我",
-    "请求权限": "每次问我",
-    "接受编辑": "自动修改",
-    "接受": "自动修改",
-    "计划": "计划模式",
-    "绕过权限": "最高权限",
-    "绕过": "最高权限",
-}
-
-MODE_DESCRIPTION_TRANSLATIONS = {
-    "Always ask before making changes": "改任何东西前都先问你",
-    "Claude pauses so you can approve each action.": "改任何东西前都先问你",
-    "Claude pauses so you can approve every action.": "改任何东西前都先问你",
-    "Automatically accept all file edits": "自动改，不用你管",
-    "Create a plan before making changes": "先制定计划，确认后再执行修改",
-    "Accepts all permissions": "Claude 可自动执行任何操作，不再询问",
-    "在进行更改之前始终询问": "改任何东西前都先问你",
-    "Claude停顿了一下，以便你可以批准每个操作。": "改任何东西前都先问你",
-    "自动接受所有文件编辑": "自动改，不用你管",
-    "在进行更改之前创建计划": "先制定计划，确认后再执行修改",
-    "接受所有权限": "Claude 可自动执行任何操作，不再询问",
-}
-
-
-FONT_PRESETS = [
-    {
-        "id": "windows-modern",
-        "label": "Windows 现代默认",
-        "family": "Microsoft YaHei UI, Microsoft YaHei, Segoe UI, sans-serif",
-    },
-    {
-        "id": "yahei",
-        "label": "微软雅黑",
-        "family": "Microsoft YaHei, Microsoft YaHei UI, Segoe UI, sans-serif",
-    },
-    {
-        "id": "dengxian",
-        "label": "等线",
-        "family": "DengXian, Microsoft YaHei UI, Segoe UI, sans-serif",
-    },
-]
-
-
-def font_inject_script() -> str:
-    presets_json = json.dumps(FONT_PRESETS, ensure_ascii=False, separators=(",", ":"))
-    mode_labels_json = json.dumps(MODE_LABEL_TRANSLATIONS, ensure_ascii=False, separators=(",", ":"))
-    mode_descriptions_json = json.dumps(MODE_DESCRIPTION_TRANSLATIONS, ensure_ascii=False, separators=(",", ":"))
-    body = f'''
-;(()=>{{
-  if (globalThis.__CLAUDE_ZH_CN_FONT_PATCH__) return;
-  globalThis.__CLAUDE_ZH_CN_FONT_PATCH__ = true;
-  globalThis.__CLAUDE_ZH_CN_VISIBLE_TEXT_FIX_PATCH__ = true;
-  const KEY = "{FONT_KEY}";
-  const PRESETS = {presets_json};
-  const DEFAULT = PRESETS[0].family;
-  const STYLE_ID = "claude-zh-cn-font-style";
-  const PANEL_ID = "claude-zh-cn-font-panel";
-  const FLOATING_PANEL_ID = "claude-zh-cn-font-floating-panel";
-  const FAB_ID = "claude-zh-cn-font-fab";
-  const FALLBACK = "Microsoft YaHei UI, Microsoft YaHei, Segoe UI, Arial, sans-serif";
-  const state = {{ fontFaceUrl: "" }};
-
-  const readConfig = () => {{
-    try {{
-      const raw = localStorage.getItem(KEY);
-      if (!raw) return {{ mode: "preset", presetId: "windows-modern", family: DEFAULT }};
-      const data = JSON.parse(raw);
-      return {{
-        mode: data.mode || "preset",
-        presetId: data.presetId || "windows-modern",
-        family: data.family || DEFAULT,
-        fontName: data.fontName || "",
-        importedName: data.importedName || "",
-        importedCss: data.importedCss || ""
-      }};
-    }} catch {{
-      return {{ mode: "preset", presetId: "windows-modern", family: DEFAULT }};
-    }}
-  }};
-
-  const saveConfig = (cfg) => {{
-    const current = readConfig();
-    const next = {{ ...current, ...cfg }};
-    localStorage.setItem(KEY, JSON.stringify(next));
-    applyFont(next);
-    return next;
-  }};
-
-  const cssFamily = (cfg) => {{
-    if (cfg.mode === "custom" && cfg.fontName) return `"${{cfg.fontName.replaceAll('"', '\\"')}}", ${{FALLBACK}}`;
-    if (cfg.mode === "imported" && cfg.importedName) return `"${{cfg.importedName.replaceAll('"', '\\"')}}", ${{FALLBACK}}`;
-    const preset = PRESETS.find((item) => item.id === cfg.presetId);
-    return (preset && preset.family) || cfg.family || DEFAULT;
-  }};
-
-  function applyFont(cfg = readConfig()) {{
-    let style = document.getElementById(STYLE_ID);
-    if (!style) {{
-      style = document.createElement("style");
-      style.id = STYLE_ID;
-      document.head.appendChild(style);
-    }}
-    const family = cssFamily(cfg);
-    const importedCss = cfg.mode === "imported" && cfg.importedCss ? cfg.importedCss : "";
-    style.textContent = `
-${{importedCss}}
-:root {{ --claude-zh-cn-font-family: ${{family}}; }}
-html, body, #root, #__next, #app {{
-  font-family: var(--claude-zh-cn-font-family) !important;
-}}
-body :is(div,span,p,h1,h2,h3,h4,h5,h6,a,button,label,legend,li,dt,dd,th,td,caption,small,strong,em,b,i,input,textarea,select,option,[role="dialog"],[role="menu"],[role="tooltip"],[role="listbox"],[role="option"],[contenteditable="true"]):not(svg):not(svg *):not([aria-hidden="true"]):not([data-icon]):not([class*="icon" i]):not([class*="lucide" i]):not([class*="codicon" i]):not([class*="material" i]):not([class*="fa-" i]) {{
-  font-family: var(--claude-zh-cn-font-family) !important;
-}}
-pre, code, kbd, samp, .monaco-editor, .monaco-editor *, .xterm, .xterm * {{
-  font-family: var(--claude-zh-cn-font-family) !important;
-}}
-svg text, svg tspan {{
-  font-family: var(--claude-zh-cn-font-family) !important;
-}}
-`;
-    document.documentElement.style.setProperty("--claude-zh-cn-font-family", family);
-    window.dispatchEvent(new CustomEvent("claude-zh-cn-font-changed", {{ detail: cfg }}));
-  }}
-
-  const labelStyle = "display:block;margin:8px 0 4px;font-size:12px;color:var(--text-300,#666);";
-  const inputStyle = "width:100%;box-sizing:border-box;border:1px solid var(--border-300,#ddd);border-radius:8px;padding:8px;background:var(--bg-000,#fff);color:inherit;";
-  const buttonStyle = "border:1px solid var(--border-300,#ddd);border-radius:8px;padding:6px 9px;background:var(--bg-100,#f7f7f7);color:inherit;cursor:pointer;";
-  const panelStyle = "margin:0;padding:10px;border:1px solid var(--border-200,#e6e6e6);border-radius:12px;background:var(--bg-000,#fff);box-shadow:0 12px 30px rgba(0,0,0,.13);backdrop-filter:blur(10px);";
-  const mutedText = "font-size:11px;line-height:1.4;color:var(--text-300,#666);";
-  const sectionStyle = "padding:9px;border:1px solid var(--border-200,#e6e6e6);border-radius:10px;background:var(--bg-050,#fafafa);";
-  const sectionAltStyle = "padding:9px;border:1px solid var(--border-300,#ddd);border-radius:10px;background:var(--bg-000,#fff);";
-  const previewStyle = "padding:12px;border:1px solid var(--border-300,#ddd);border-radius:12px;background:linear-gradient(180deg,var(--bg-000,#fff),var(--bg-050,#fafafa));min-height:130px;";
-  const segmentBase = "flex:1;min-width:0;border:0;border-radius:7px;padding:6px 7px;background:transparent;color:var(--text-300,#666);cursor:pointer;font-size:11px;font-weight:600;text-align:center;transition:background .12s ease,color .12s ease,box-shadow .12s ease;";
-  const segmentActive = "background:var(--bg-000,#fff);color:var(--text-500,#111);box-shadow:0 1px 2px rgba(0,0,0,.07),inset 0 0 0 1px var(--border-300,#ddd);";
-
-  const MODE_LABEL_FIXES = new Map(Object.entries({mode_labels_json}));
-  const MODE_DESCRIPTION_FIXES = new Map(Object.entries({mode_descriptions_json}));
-
-  const VISIBLE_TEXT_FIXES = new Map([
-    ["auto", "自动"],
-    ["Auto", "自动"],
-    ["light", "浅色"],
-    ["Light", "浅色"],
-    ["dark", "深色"],
-    ["Dark", "深色"],
-    ["sans", "无衬线"],
-    ["Sans", "无衬线"],
-    ["New task", "新建任务"],
-    ["New session", "新建会话"],
-    ["Projects", "项目"],
-    ["New", "新建"],
-    ["New Projects", "新建项目"],
-    ["Artifacts", "作品"],
-    ["Scheduled", "定时"],
-    ["Customize", "定制"],
-    ["Status", "状态"],
-    ["Project", "项目"],
-    ["Last activity", "最近活动"],
-    ["Group by", "分组方式"],
-    ["Date", "日期"],
-    ["Environment", "环境"],
-    ["Custom groups", "自定义分组"],
-    ["None", "无"],
-    ["1d", "1天"],
-    ["3d", "3天"],
-    ["7d", "7天"],
-    ["30d", "30天"],
-    ["All", "全部"],
-    ["All projects", "所有项目"],
-    ["View all", "查看全部"],
-    ["Viewall", "查看全部"],
-    ["Connect new sessions to Remote Control", "新会话自动连接远程控制"],
-    ["Sessions you start on this computer connect to Remote Control automatically, so you can continue them from the terminal or claude.ai/code.", "在此电脑上启动的会话将自动连接远程控制，以便你可以从终端或 claude.ai/code 继续操作。"],
-    ["Archive inactive sessions", "自动归档闲置会话"],
-    ["Automatically archive local sessions after a period of no activity. Sessions that are running or have background work are never archived, and a worktree with uncommitted changes is kept on disk.", "一段时间无活动后自动归档本地会话。正在运行或有后台工作的会话不会被归档，包含未提交更改的工作树将保留在磁盘上。"],
-    ["Inference configuration", "模型配置"],
-    ["Type / for commands", "按 / 打开命令面板"],
-    ["Transcript view", "对话记录视图"],
-    ["Temperature", "随机性"],
-    ["System Prompt", "预设指令"],
-    ["Live artifacts", "实时作品"],
-    ["实时 Artifacts", "实时作品"],
-    ["Create your first scheduled task", "创建你的第一个计划任务"],
-    ["Daily brief", "每日简报"],
-    ["Weekly review", "每周回顾"],
-    ["Skills have moved to Customize.", "技能已移至“自定义”。"],
-    ["Skills have moved to", "技能已移至"],
-    ["Connectors have moved to Customize. Head there to browse, connect, and manage them.", "连接器已移至“自定义”。前往那里浏览、连接和管理连接器。"],
-    ["Connectors have moved to", "连接器已移至"],
-    ["Head there to browse, connect, and manage them.", "前往那里浏览、连接和管理连接器。"],
-    ["Run tasks on a schedule or whenever you need them. Type /schedule in any existing task to set one up.", "按计划或在需要时运行任务。在任何现有任务中输入 /schedule 即可设置。"],
-    ["allow", "允许"],
-    ["ask", "询问"],
-    ["blocked", "已阻止"],
-    ["Create dynamic artifacts that stay up-to-date using live data from your connectors.", "使用来自连接器的实时数据，创建保持更新的动态作品。"],
-    ["Create dynamic artifacts that stay up-to-date using live data from your connectors", "使用来自连接器的实时数据，创建保持更新的动态作品"],
-    ["Create dynamic artifacts that stay up to date using live data from your connectors.", "使用来自连接器的实时数据，创建保持更新的动态作品。"],
-  ]);
-
-  const VISIBLE_TEXT_SUBSTRING_FIXES = [
-    [/实时\\s+Artifacts/g, "实时作品"],
-    [/实时\\s+Artifact/g, "实时作品"],
-    [/\\bArtifacts\\b/g, "作品"],
-    [/\\bArtifact\\b/g, "作品"],
-  ];
-  const TEXT_FIX_INITIAL_LIMIT = 900;
-  const TEXT_FIX_MUTATION_LIMIT = 180;
-  const TEXT_FIX_ROOT_LIMIT = 24;
-  const TEXT_FIX_MIN_INTERVAL_MS = 900;
-  let textFixScheduled = false;
-  let pendingTextFixRoots = [];
-  let lastTextFixAt = 0;
-  let fontVisibilityTimer = 0;
-  let fontProviderSettingsCache = {{ key: "", at: 0, value: false }};
-
-  const NAV_LABEL_FIXES = new Map([
-    ["Cowork", "办公"],
-    ["协作", "办公"],
-    ["Code", "编码"],
-    ["代码", "编码"],
-  ]);
-
-  function isProtectedTextNode(node) {{
-    const parent = node.parentElement;
-    if (!parent) return true;
-    return Boolean(parent.closest(
-      "script,style,code,pre,kbd,samp,textarea,input,[contenteditable='true'],[data-message-author-role],[data-testid*='message' i]"
-    ));
-  }}
-
-  function replaceTrimmedText(node, text, trimmed, replacement) {{
-    if (!replacement || replacement === trimmed) return false;
-    node.nodeValue = text.replace(trimmed, replacement);
-    return true;
-  }}
-
-  function modeMenuScope(parent) {{
-    const scope = parent.closest("[role='menu'],[role='listbox'],[data-radix-menu-content],[data-radix-popper-content-wrapper]");
-    if (!scope) return null;
-    const text = scope.textContent || "";
-    const labels = [
-      "Manual", "Manual permissions", "Ask permissions", "Accept edits", "Plan", "Bypass permissions",
-      "每次问我", "自动修改", "计划模式", "最高权限", "手册", "手动批准", "请求权限", "接受编辑", "绕过权限"
-    ];
-    return labels.filter((label) => text.includes(label)).length >= 2 ? scope : null;
-  }}
-
-  function isComposerModeButton(parent) {{
-    const button = parent.closest("button,[role='button']");
-    if (!button) return false;
-    let cursor = button.parentElement;
-    for (let depth = 0; cursor && depth < 7; depth += 1, cursor = cursor.parentElement) {{
-      if (cursor.querySelector("textarea,[contenteditable='true']")) return true;
-    }}
-    return false;
-  }}
-
-  function fixContextualTextNode(node, text, trimmed) {{
-    const parent = node.parentElement;
-    if (!parent) return false;
-
-    const navReplacement = NAV_LABEL_FIXES.get(trimmed);
-    if (navReplacement) {{
-      const nav = parent.closest("nav,[role='navigation']");
-      const interactive = parent.closest("a,button,[role='tab'],[role='link'],[role='button']");
-      const href = interactive?.getAttribute("href") || "";
-      const testId = interactive?.getAttribute("data-testid") || "";
-      const value = interactive?.getAttribute("data-value") || "";
-      const surfaceSignal = interactive && (
-        interactive.getAttribute("role") === "tab" ||
-        /(?:^|[-_/])(cowork|code)(?:$|[-_/])/i.test(`${{href}} ${{testId}} ${{value}}`)
-      );
-      if (nav && surfaceSignal) return replaceTrimmedText(node, text, trimmed, navReplacement);
-    }}
-
-    if (trimmed === "Gateway" || trimmed === "第三方") {{
-      const menu = parent.closest("[role='menu'],[data-radix-menu-content]");
-      const menuText = menu?.textContent || "";
-      const userMenuSignal = menu && (
-        menu.matches("[data-testid*='user-menu']") ||
-        menu.querySelector("[data-testid*='user-menu']") ||
-        /(Inference configuration|模型配置|Get help|获取帮助|Settings|设置)/.test(menuText)
-      );
-      if (userMenuSignal) return replaceTrimmedText(node, text, trimmed, "第三方API");
-    }}
-
-    const modeReplacement = MODE_LABEL_FIXES.get(trimmed);
-    if (modeReplacement && (modeMenuScope(parent) || isComposerModeButton(parent))) {{
-      return replaceTrimmedText(node, text, trimmed, modeReplacement);
-    }}
-
-    const modeDescription = MODE_DESCRIPTION_FIXES.get(trimmed);
-    if (modeDescription && modeMenuScope(parent)) {{
-      return replaceTrimmedText(node, text, trimmed, modeDescription);
-    }}
-
-    if ((trimmed === "Fork" || trimmed === "分叉" || trimmed === "分支") && parent.closest("[role='menu'],[data-radix-menu-content]")) {{
-      return replaceTrimmedText(node, text, trimmed, "分支对话");
-    }}
-
-    if ((trimmed === "Thread" || trimmed === "线程") && parent.closest("aside,nav") && parent.closest("h1,h2,h3,h4,[role='heading']")) {{
-      return replaceTrimmedText(node, text, trimmed, "对话");
-    }}
-
-    return false;
-  }}
-
-  function shouldFixTextNode(node) {{
-    const parent = node.parentElement;
-    if (!parent || isProtectedTextNode(node)) return false;
-    const scope = parent.closest("[role='dialog'],[role='menu'],[role='listbox'],[role='navigation'],main,section,nav,aside");
-    if (!scope) return false;
-    const context = scope.textContent || "";
-    return /(Appearance|外观|颜色模式|Color mode|聊天字体|Chat font|Font|字体|Artifact|Artifacts|Live artifacts|实时 Artifacts|实时作品|dynamic artifacts|动态作品|connectors|连接器|Scheduled|已安排|Customize|自定义)/.test(context);
-  }}
-
-  function fixVisibleText(root = document.body) {{
-    if (!root) return;
-    const limit = root === document.body || root === document.documentElement ? TEXT_FIX_INITIAL_LIMIT : TEXT_FIX_MUTATION_LIMIT;
-    if (root.nodeType === Node.TEXT_NODE) {{
-      processTextNode(root);
-      return;
-    }}
-    if (root.nodeType !== 1) return;
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    const nodes = [];
-    while (nodes.length < limit) {{
-      const node = walker.nextNode();
-      if (!node) break;
-      nodes.push(node);
-    }}
-    nodes.forEach(processTextNode);
-  }}
-
-  function processTextNode(node) {{
-    const text = node.nodeValue;
-    if (!text || isProtectedTextNode(node)) return;
-    const trimmed = text.trim();
-    if (!trimmed || /Documents[\\/]+Claude[\\/]+Artifacts/i.test(trimmed)) return;
-    if (fixContextualTextNode(node, text, trimmed)) return;
-    const modeDescription = MODE_DESCRIPTION_FIXES.get(trimmed);
-    if (modeDescription && replaceTrimmedText(node, text, trimmed, modeDescription)) return;
-    const replacement = VISIBLE_TEXT_FIXES.get(trimmed);
-    if (replacement) {{
-      replaceTrimmedText(node, text, trimmed, replacement);
-      return;
-    }}
-    if (!shouldFixTextNode(node)) return;
-    let next = text;
-    VISIBLE_TEXT_SUBSTRING_FIXES.forEach(([pattern, value]) => {{
-      next = next.replace(pattern, value);
-    }});
-    if (next !== text) node.nodeValue = next;
-  }}
-
-  function runTextFixQueue() {{
-    textFixScheduled = false;
-    lastTextFixAt = performance?.now?.() || Date.now();
-    const roots = pendingTextFixRoots.splice(0, pendingTextFixRoots.length);
-    if (!roots.length) roots.push(document.body);
-    roots.forEach((root) => fixVisibleText(root));
-  }}
-
-  function scheduleFixVisibleText(root = document.body) {{
-    if (root && !pendingTextFixRoots.includes(root)) {{
-      if (root === document.body || root === document.documentElement) pendingTextFixRoots = [root];
-      else if (pendingTextFixRoots.length < TEXT_FIX_ROOT_LIMIT) pendingTextFixRoots.push(root);
-    }}
-    if (textFixScheduled) return;
-    textFixScheduled = true;
-    const now = performance?.now?.() || Date.now();
-    const delay = Math.max(0, TEXT_FIX_MIN_INTERVAL_MS - (now - lastTextFixAt));
-    window.setTimeout(() => {{
-      const idle = window.requestIdleCallback || ((callback) => window.setTimeout(callback, 60));
-      idle(runTextFixQueue, {{ timeout: 1000 }});
-    }}, delay);
-  }}
-
-  function buildPanel(expanded = false, mode = "inline") {{
-    const panel = document.createElement("section");
-    panel.id = mode === "floating" ? FLOATING_PANEL_ID : PANEL_ID;
-    panel.dataset.fontPanelMode = mode;
-    panel.style.cssText = panelStyle + (mode === "floating" ? "width:min(520px,calc(100vw - 40px));" : "width:100%;box-sizing:border-box;");
-    panel.innerHTML = `
-      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;">
-        <div>
-          <h3 style="margin:0;font-size:13px;font-weight:700;letter-spacing:-0.01em;">中文字体</h3>
-          <p style="margin:4px 0 0;${{mutedText}}">调整 Claude 界面的中文字体。</p>
-        </div>
-        <button data-font-toggle style="${{buttonStyle}};white-space:nowrap;font-size:11px;">${{expanded ? "收起" : "字体"}}</button>
-      </div>
-
-      <div data-font-body style="display:${{expanded ? "block" : "none"}};margin-top:8px;">
-      <div data-font-layout style="display:grid;grid-template-columns:minmax(0,1.25fr) minmax(150px,.75fr);gap:10px;align-items:stretch;">
-      <div style="display:flex;flex-direction:column;gap:8px;">
-      <div style="${{sectionStyle}}">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px;">
-          <label style="margin:0;font-size:11px;font-weight:600;color:var(--text-400,#444);">内置推荐</label>
-          <span data-font-status style="font-size:11px;color:var(--text-300,#666);"></span>
-        </div>
-        <div data-font-preset-group style="display:flex;gap:1px;padding:2px;border:1px solid var(--border-300,#ddd);border-radius:10px;background:var(--bg-100,#f5f5f5);box-shadow:inset 0 1px 2px rgba(0,0,0,.04);">
-          ${{PRESETS.map((item) => `<button type="button" data-font-preset-btn="${{item.id}}" style="${{segmentBase}}">${{item.label}}</button>`).join("")}}
-        </div>
-        <p style="margin:5px 0 0;${{mutedText}}">推荐字体，直接切换。</p>
-      </div>
-
-      <div style="${{sectionAltStyle}}">
-        <label style="margin:0 0 5px;display:block;font-size:11px;font-weight:600;color:var(--text-400,#444);">自定义系统字体名</label>
-        <div style="display:flex;gap:5px;align-items:center;">
-          <input data-font-name placeholder="已安装字体名称" style="${{inputStyle}};min-width:0;padding:6px 7px;font-size:11px;" />
-          <button data-font-apply-custom style="${{buttonStyle}};white-space:nowrap;font-size:11px;">应用</button>
-        </div>
-        <p style="margin:5px 0 0;${{mutedText}}">输入已安装字体名。</p>
-      </div>
-
-      <div style="${{sectionStyle}}">
-        <label style="margin:0 0 5px;display:block;font-size:11px;font-weight:600;color:var(--text-400,#444);">导入本地字体文件</label>
-        <input data-font-file type="file" accept=".ttf,.otf,font/ttf,font/otf" style="${{inputStyle}};padding:4px 5px;font-size:11px;" />
-        <p style="margin:5px 0 0;${{mutedText}}">选择本地 .ttf / .otf。</p>
-      </div>
-      </div>
-
-      <div style="${{previewStyle}}">
-        <div style="margin:0 0 8px;font-size:11px;font-weight:600;color:var(--text-400,#444);">预览</div>
-        <div style="font-size:16px;line-height:1.45;font-weight:600;color:var(--text-500,#111);">中文字体预览</div>
-        <div style="margin-top:8px;${{mutedText}}">Claude Desktop 中文补丁</div>
-        <div style="margin-top:14px;font-size:11px;color:var(--text-300,#666);">Aa 你好 Claude</div>
-      </div>
-      </div>
-      <div style="display:flex;justify-content:flex-end;margin-top:8px;">
-        <button data-font-reset style="${{buttonStyle}};white-space:nowrap;font-size:11px;">恢复默认</button>
-      </div>
-      </div>
-    `;
-
-    const presetButtons = [...panel.querySelectorAll("[data-font-preset-btn]")];
-    const fontName = panel.querySelector("[data-font-name]");
-    const status = panel.querySelector("[data-font-status]");
-    const updateLayout = () => {{
-      const layout = panel.querySelector("[data-font-layout]");
-      if (!layout) return;
-      layout.style.gridTemplateColumns = panel.getBoundingClientRect().width < 430 ? "1fr" : "minmax(0,1.25fr) minmax(150px,.75fr)";
-    }};
-    panel.querySelector("[data-font-toggle]").addEventListener("click", () => {{
-      if (panel.dataset.fontPanelMode === "floating") {{
-        panel.remove();
-        return;
-      }}
-      const body = panel.querySelector("[data-font-body]");
-      const willExpand = body.style.display === "none";
-      body.style.display = willExpand ? "block" : "none";
-      panel.querySelector("[data-font-toggle]").textContent = willExpand ? "收起" : "字体";
-      if (willExpand) updateLayout();
-    }});
-    const setActivePreset = (presetId) => {{
-      presetButtons.forEach((button) => {{
-        const active = button.getAttribute("data-font-preset-btn") === presetId;
-        button.style.cssText = `${{segmentBase}}${{active ? segmentActive : ""}}`;
-      }});
-    }};
-    const sync = () => {{
-      const cfg = readConfig();
-      const currentPreset = cfg.presetId || "windows-modern";
-      setActivePreset(currentPreset);
-      fontName.value = cfg.fontName || "";
-      status.textContent = cfg.mode === "custom" ? `当前：${{cfg.fontName}}` : cfg.mode === "imported" ? `当前：${{cfg.importedName}}` : `当前：${{PRESETS.find((item) => item.id === cfg.presetId)?.label || "Windows 现代默认"}}`;
-    }};
-    presetButtons.forEach((button) => {{
-      button.addEventListener("click", () => {{
-        const item = PRESETS.find((entry) => entry.id === button.getAttribute("data-font-preset-btn")) || PRESETS[0];
-        saveConfig({{ mode: "preset", presetId: item.id, family: item.family }});
-        sync();
-      }});
-    }});
-    panel.querySelector("[data-font-apply-custom]").addEventListener("click", () => {{
-      const name = fontName.value.trim();
-      if (!name) return;
-      saveConfig({{ mode: "custom", fontName: name }});
-      sync();
-    }});
-    panel.querySelector("[data-font-file]").addEventListener("change", async (event) => {{
-      const file = event.target.files && event.target.files[0];
-      if (!file) return;
-      const buffer = await file.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
-      let binary = "";
-      for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
-      const b64 = btoa(binary);
-      const name = `ClaudeZhCnImported-${{Date.now()}}`;
-      const format = file.name.toLowerCase().endsWith(".otf") ? "opentype" : "truetype";
-      const css = `@font-face{{font-family:"${{name}}";src:url(data:font/${{format}};base64,${{b64}}) format("${{format}}");font-display:swap;}}`;
-      saveConfig({{ mode: "imported", importedName: name, importedCss: css }});
-      sync();
-    }});
-    panel.querySelector("[data-font-reset]").addEventListener("click", () => {{
-      localStorage.removeItem(KEY);
-      applyFont();
-      sync();
-    }});
-    sync();
-    updateLayout();
-    return panel;
-  }}
-
-  function openFloatingPanel() {{
-    let panel = document.getElementById(FLOATING_PANEL_ID);
-    if (!panel) {{
-      panel = buildPanel(true, "floating");
-      panel.style.position = "fixed";
-      panel.style.right = "20px";
-      panel.style.bottom = "76px";
-      panel.style.zIndex = "2147483647";
-      panel.style.width = "min(520px, calc(100vw - 40px))";
-      panel.style.boxShadow = "0 18px 60px rgba(0,0,0,.24)";
-      document.body.appendChild(panel);
-      const button = document.getElementById(FAB_ID);
-      if (button) setFloatingFontButtonExpanded(button, true);
-    }} else {{
-      panel.remove();
-      const button = document.getElementById(FAB_ID);
-      if (button) setFloatingFontButtonExpanded(button, false);
-    }}
-  }}
-
-  function isThirdPartyProviderSettingsPage() {{
-    const root = document.querySelector("main,[role='main']") || document.body;
-    const now = performance?.now?.() || Date.now();
-    const key = `${{location.pathname}}:${{root?.textContent?.length || 0}}`;
-    if (fontProviderSettingsCache.key === key && now - fontProviderSettingsCache.at < 1200) return fontProviderSettingsCache.value;
-    const text = (root?.textContent || "").slice(0, 12000);
-    const hasProviderTitle = /(管理第三方供应商|第三方供应商|Manage third-party|Inference provider)/i.test(text);
-    const hasProviderFields = /(第三方认证方案|自定义推理标头|Authorization|x-api-key|模型发现|测试模型发现|Gateway base URL|Gateway API key)/i.test(text);
-    fontProviderSettingsCache = {{ key, at: now, value: hasProviderTitle && hasProviderFields }};
-    return fontProviderSettingsCache.value;
-  }}
-
-  function syncFloatingFontButtonVisibility() {{
-    const button = document.getElementById(FAB_ID);
-    if (!button) return;
-    const hidden = isThirdPartyProviderSettingsPage();
-    button.style.display = hidden ? "none" : "";
-    if (hidden) document.getElementById(FLOATING_PANEL_ID)?.remove();
-  }}
-
-  function scheduleFloatingFontButtonVisibility() {{
-    if (fontVisibilityTimer) return;
-    fontVisibilityTimer = window.setTimeout(() => {{
-      fontVisibilityTimer = 0;
-      syncFloatingFontButtonVisibility();
-    }}, 700);
-  }}
-
-  function setFloatingFontButtonExpanded(button, expanded) {{
-    button.style.transform = expanded ? "translateX(0)" : "translateX(calc(100% - 12px))";
-    button.style.opacity = expanded ? "1" : ".62";
-  }}
-
-  function mountFloatingButton() {{
-    if (!document.body || document.getElementById(FAB_ID)) return;
-    const button = document.createElement("button");
-    button.id = FAB_ID;
-    button.type = "button";
-    button.textContent = "字体";
-    button.title = "中文字体设置";
-    button.style.cssText = "position:fixed;right:0;bottom:20px;z-index:2147483647;border:1px solid var(--border-300,#ddd);border-radius:999px;padding:8px 12px;background:var(--bg-000,#fff);color:inherit;box-shadow:0 8px 28px rgba(0,0,0,.18);cursor:pointer;font-size:13px;white-space:nowrap;transform:translateX(calc(100% - 12px));opacity:.62;transition:transform .16s ease,opacity .12s ease,box-shadow .12s ease;";
-    button.addEventListener("click", openFloatingPanel);
-    button.addEventListener("mouseenter", () => setFloatingFontButtonExpanded(button, true));
-    button.addEventListener("focus", () => setFloatingFontButtonExpanded(button, true));
-    button.addEventListener("mouseleave", () => {{
-      if (!document.getElementById(FLOATING_PANEL_ID)) setFloatingFontButtonExpanded(button, false);
-    }});
-    button.addEventListener("blur", () => {{
-      if (!document.getElementById(FLOATING_PANEL_ID)) setFloatingFontButtonExpanded(button, false);
-    }});
-    document.body.appendChild(button);
-    syncFloatingFontButtonVisibility();
-  }}
-
-  function mountPanel() {{
-    return;
-  }}
-
-  const start = () => {{
-    applyFont();
-    mountFloatingButton();
-    scheduleFixVisibleText(document.body);
-    const observer = new MutationObserver((mutations) => {{
-      scheduleFloatingFontButtonVisibility();
-      let queued = 0;
-      for (const mutation of Array.from(mutations || []).slice(0, 24)) {{
-        for (const node of Array.from(mutation.addedNodes || []).slice(0, 12)) {{
-          const root = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
-          if (!root || root.nodeType !== 1) continue;
-          scheduleFixVisibleText(root);
-          queued += 1;
-          if (queued >= TEXT_FIX_ROOT_LIMIT) return;
-        }}
-      }}
-    }});
-    observer.observe(document.body, {{ childList: true, subtree: true }});
-  }};
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start, {{ once: true }});
-  else start();
-}})();
-'''.strip()
-    return "\n".join([
-        "// __CLAUDE_ZH_CN_FONT_PATCH_BEGIN__",
-        body,
-        "// __CLAUDE_ZH_CN_FONT_PATCH_END__",
-    ])
-
-
-def session_delete_inject_script() -> str:
-    body = r'''
-;(()=>{
-  const VERSION = "46";
-  try {
-  if (globalThis.__CLAUDE_ZH_CN_SESSION_DELETE_PATCH_VERSION__ === VERSION) return;
-  globalThis.__CLAUDE_ZH_CN_SESSION_DELETE_PATCH__ = true;
-  globalThis.__CLAUDE_ZH_CN_SESSION_DELETE_PATCH_VERSION__ = VERSION;
-
-  const STYLE_ID = "claude-zh-cn-session-delete-style";
-  const ACTION_BUTTON_CLASS = "claude-zh-cn-session-action-button";
-  const BUTTON_CLASS = "claude-zh-cn-session-delete-button";
-  const EXPORT_BUTTON_CLASS = "claude-zh-cn-session-export-button";
-  const MOVE_BUTTON_CLASS = "claude-zh-cn-session-move-button";
-  const PORTAL_BUTTON_CLASS = "claude-zh-cn-session-delete-portal-button";
-  const TOOLTIP_CLASS = "claude-zh-cn-session-delete-tooltip";
-  const TOAST_CLASS = "claude-zh-cn-session-delete-toast";
-  const TIMELINE_ID = "claude-zh-cn-conversation-timeline";
-  const CENTERED_CLASS = "claude-zh-cn-centered-layout";
-  const CENTERED_TOGGLE_ID = "claude-zh-cn-centered-layout-toggle";
-  const CENTERED_WIDTH_KEY = "claude-zh-cn-centered-layout-width";
-  const SCROLL_STORAGE_PREFIX = "claude-zh-cn-scroll:";
-  const LOCAL_DELETE_QUEUE = "__CLAUDE_ZH_CN_LOCAL_SESSION_DELETE_REQUESTS__";
-  const LOCAL_DELETE_RESULTS = "__CLAUDE_ZH_CN_LOCAL_SESSION_DELETE_RESULTS__";
-  const LOCAL_DELETE_BRIDGE = "__CLAUDE_ZH_CN_LOCAL_SESSION_DELETE_BRIDGE__";
-  const ROW_FLAG = "data-claude-zh-cn-delete-row";
-  const ROW_SELECTORS = [
-    "[data-app-action-sidebar-thread-id]",
-    "[data-session-id]",
-    "[data-thread-id]",
-    "[data-conversation-id]",
-    "[data-chat-id]",
-    "[data-testid*='conversation']",
-    "[data-testid*='chat']",
-    "[aria-current]",
-    "a[href^='/chat/']",
-    "a[href^='/conversation/']",
-    "a[href^='/thread/']",
-    "a[href^='/session/']",
-    "a[href*='://claude.ai/chat/']",
-    "aside a[href*='/chat/']",
-    "aside a[href*='/conversation/']",
-    "aside a[href*='/thread/']",
-    "aside button",
-    "aside [role='button']",
-    "aside [role='link']",
-    "aside [role='treeitem']",
-    "aside [role='listitem']",
-    "aside [tabindex]:not([tabindex='-1'])",
-    "nav a[href*='/chat/']",
-    "nav a[href*='/conversation/']",
-    "nav a[href*='/thread/']",
-    "nav button",
-    "nav [role='button']",
-    "nav [role='link']",
-    "nav [role='treeitem']",
-    "nav [role='listitem']",
-    "nav [tabindex]:not([tabindex='-1'])",
-    "[role='navigation'] a[href*='/chat/']",
-    "[role='navigation'] a[href*='/conversation/']",
-    "[role='navigation'] a[href*='/thread/']",
-    "[role='navigation'] button",
-    "[role='navigation'] [role='button']",
-    "[role='navigation'] [role='link']",
-    "[role='navigation'] [role='treeitem']",
-    "[role='navigation'] [role='listitem']",
-    "[role='navigation'] [tabindex]:not([tabindex='-1'])"
-  ].join(",");
-  const SESSION_SIGNAL_SELECTORS = [
-    "[data-app-action-sidebar-thread-id]",
-    "[data-session-id]",
-    "[data-thread-id]",
-    "[data-conversation-id]",
-    "[data-chat-id]",
-    "a[href^='/chat/']",
-    "a[href^='/conversation/']",
-    "a[href^='/thread/']",
-    "a[href^='/session/']",
-    "a[href*='://claude.ai/chat/']"
-  ].join(",");
-  const INTERACTIVE_ROW_SELECTORS = [
-    "a[href]",
-    "button",
-    "[role='button']",
-    "[role='link']",
-    "[role='treeitem']",
-    "[role='listitem']",
-    "[tabindex]:not([tabindex='-1'])"
-  ].join(",");
-  const RECENTS_ROW_CANDIDATE_SELECTORS = [
-    ROW_SELECTORS,
-    INTERACTIVE_ROW_SELECTORS,
-    "[data-testid]",
-    "[class*='conversation']",
-    "[class*='Conversation']",
-    "[class*='thread']",
-    "[class*='Thread']",
-    "[class*='chat']",
-    "[class*='Chat']",
-    "li",
-    "div"
-  ].join(",");
-  const SIDEBAR_CONTAINER_SELECTORS = [
-    "aside",
-    "nav",
-    "[role='navigation']",
-    "[data-sidebar]",
-    "[data-testid*='sidebar']",
-    "[data-testid*='history']",
-    "[data-testid*='conversation']",
-    "[data-testid*='chat']",
-    "[class*='sidebar']",
-    "[class*='Sidebar']",
-    "[class*='history']",
-    "[class*='History']"
-  ].join(",");
-  const MAIN_CONTAINER_SELECTORS = "main,[role='main']";
-  let activeRow = null;
-  let portalButton = null;
-  let hidePortalTimer = 0;
-  let pendingDeleteTimer = 0;
-  let rootsCache = null;
-  const TEXT_CACHE_LIMIT = 2500;
-  const MAX_RECENTS_CANDIDATE_NODES = 96;
-  const MAX_RECENTS_FALLBACK_VISITS = 160;
-  const SCAN_DELAY_MS = 5200;
-  const SCAN_MIN_INTERVAL_MS = 24000;
-  const TIMELINE_DELAY_MS = 6200;
-  const TIMELINE_MIN_INTERVAL_MS = 30000;
-  const STARTUP_SCAN_DELAY_MS = 4200;
-  const STARTUP_TIMELINE_DELAY_MS = 1800;
-  const POINTER_ATTACH_DELAY_MS = 70;
-  const MUTATION_RECORD_LIMIT = 24;
-  const MUTATION_NODE_LIMIT = 36;
-  let visibleTextCache = new WeakMap();
-  let visibleTextCacheSize = 0;
-  let timelineSummaryCache = new WeakMap();
-  let lastTimelineSignature = "";
-  let lastMutationSummary = { records: 0, inspectedRecords: 0, inspectedNodes: 0, skippedInjected: 0, capped: false };
-  let providerSettingsCache = { key: "", at: 0, value: false };
-  let providerCleanupRunning = false;
-
-  function invalidateScanCache() {
-    rootsCache = null;
-  }
-
-  function scanCache() {
-    if (!rootsCache) rootsCache = {};
-    return rootsCache;
-  }
-
-  function resetVisibleTextCache() {
-    visibleTextCache = new WeakMap();
-    visibleTextCacheSize = 0;
-  }
-
-  function installStyle() {
-    const existing = document.getElementById(STYLE_ID);
-    if (existing?.dataset.sessionDeleteVersion === VERSION) return;
-    existing?.remove();
-    const style = document.createElement("style");
-    style.id = STYLE_ID;
-    style.dataset.sessionDeleteVersion = VERSION;
-    style.textContent = `
-      [${ROW_FLAG}="true"] {
-        position: relative !important;
-      }
-      .${ACTION_BUTTON_CLASS} {
-        position: absolute;
-        top: 50%;
-        z-index: 30;
-        width: 26px;
-        height: 26px;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        transform: translateY(-50%);
-        border: 0;
-        border-radius: 6px;
-        background: color-mix(in srgb, var(--bg-000, #ffffff) 90%, transparent);
-        color: var(--text-300, #6b7280);
-        opacity: 0;
-        pointer-events: none;
-        cursor: default;
-        transition: opacity .12s ease, background .12s ease, color .12s ease;
-      }
-      .${ACTION_BUTTON_CLASS} svg {
-        width: 15px;
-        height: 15px;
-        display: block;
-      }
-      .${BUTTON_CLASS} { right: 12px; }
-      .${EXPORT_BUTTON_CLASS} { right: 44px; }
-      .${MOVE_BUTTON_CLASS} { right: 76px; }
-      [${ROW_FLAG}="true"]:hover .${ACTION_BUTTON_CLASS},
-      [${ROW_FLAG}="true"]:focus-within .${ACTION_BUTTON_CLASS} {
-        opacity: 1;
-        pointer-events: auto;
-      }
-      [${ROW_FLAG}="true"]:has(.${ACTION_BUTTON_CLASS}) {
-        padding-right: 108px !important;
-      }
-      [${ROW_FLAG}="true"][data-claude-zh-cn-pending-delete="true"] {
-        display: none !important;
-      }
-      .${ACTION_BUTTON_CLASS}:hover,
-      .${ACTION_BUTTON_CLASS}:focus-visible {
-        background: color-mix(in srgb, #0ea5e9 14%, var(--bg-000, #ffffff));
-        color: #0369a1;
-        outline: none;
-      }
-      .${BUTTON_CLASS}:hover,
-      .${BUTTON_CLASS}:focus-visible {
-        background: color-mix(in srgb, #ef4444 16%, var(--bg-000, #ffffff));
-        color: #dc2626;
-        outline: none;
-      }
-      .${ACTION_BUTTON_CLASS}.${PORTAL_BUTTON_CLASS} {
-        position: fixed;
-        right: auto;
-        z-index: 2147483199;
-        opacity: 0;
-        pointer-events: none;
-      }
-      .${ACTION_BUTTON_CLASS}.${PORTAL_BUTTON_CLASS}[data-visible="true"] {
-        opacity: 0 !important;
-        pointer-events: none !important;
-        display: none !important;
-      }
-      [${ROW_FLAG}="true"]:hover [data-thread-title],
-      [${ROW_FLAG}="true"]:focus-within [data-thread-title],
-      [${ROW_FLAG}="true"]:hover .truncate,
-      [${ROW_FLAG}="true"]:focus-within .truncate {
-        max-width: none !important;
-        overflow: visible !important;
-        text-overflow: clip !important;
-        white-space: normal !important;
-        word-break: break-word;
-      }
-      .${TOOLTIP_CLASS},
-      .${TOAST_CLASS} {
-        position: fixed;
-        z-index: 2147483201;
-        border-radius: 8px;
-        background: #242628;
-        color: #f4f4f5;
-        font: 13px/18px system-ui, sans-serif;
-        box-shadow: 0 14px 40px rgba(0,0,0,.28);
-        pointer-events: none;
-      }
-      .${TOOLTIP_CLASS} {
-        padding: 7px 9px;
-        white-space: nowrap;
-      }
-      .${TOAST_CLASS} {
-        right: 18px;
-        bottom: 56px;
-        max-width: min(420px, calc(100vw - 36px));
-        padding: 10px 12px;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-      }
-      .${TOAST_CLASS} button {
-        border: 0;
-        border-radius: 6px;
-        background: #f4f4f5;
-        color: #18181b;
-        font: 12px/16px system-ui, sans-serif;
-        padding: 4px 7px;
-        cursor: default;
-      }
-      .claude-zh-cn-session-delete-confirm-overlay {
-        position: fixed;
-        inset: 0;
-        z-index: 2147483200;
-        display: grid;
-        place-items: center;
-        background: rgba(0,0,0,.28);
-      }
-      .claude-zh-cn-session-delete-confirm-content {
-        width: min(360px, calc(100vw - 32px));
-        border: 1px solid rgba(255,255,255,.12);
-        border-radius: 12px;
-        background: var(--bg-000, #ffffff);
-        color: var(--text-500, #111827);
-        box-shadow: 0 18px 60px rgba(0,0,0,.28);
-        padding: 16px;
-      }
-      .claude-zh-cn-session-delete-confirm-title {
-        font: 600 15px/22px system-ui, sans-serif;
-      }
-      .claude-zh-cn-session-delete-confirm-message {
-        margin-top: 8px;
-        color: var(--text-300, #6b7280);
-        font: 13px/20px system-ui, sans-serif;
-      }
-      .claude-zh-cn-session-delete-confirm-actions {
-        display: flex;
-        justify-content: flex-end;
-        gap: 8px;
-        margin-top: 16px;
-      }
-      .claude-zh-cn-session-delete-confirm-actions button {
-        border: 1px solid var(--border-300, #d1d5db);
-        border-radius: 8px;
-        background: var(--bg-000, #ffffff);
-        color: inherit;
-        font: 13px/18px system-ui, sans-serif;
-        padding: 7px 10px;
-        cursor: default;
-      }
-      .claude-zh-cn-session-delete-confirm-actions [data-claude-delete-confirm] {
-        border-color: #ef4444;
-        background: #dc2626;
-        color: #ffffff;
-      }
-      .claude-zh-cn-session-move-list {
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-        max-height: min(360px, calc(100vh - 220px));
-        overflow: auto;
-        margin-top: 12px;
-      }
-      .claude-zh-cn-session-move-list button {
-        width: 100%;
-        border: 1px solid var(--border-300, #d1d5db);
-        border-radius: 8px;
-        background: var(--bg-000, #ffffff);
-        color: inherit;
-        text-align: left;
-        font: 13px/18px system-ui, sans-serif;
-        padding: 8px 10px;
-        cursor: default;
-      }
-      .claude-zh-cn-session-move-list button:hover,
-      .claude-zh-cn-session-move-list button:focus-visible {
-        background: color-mix(in srgb, var(--text-500, #111827) 8%, transparent);
-        outline: none;
-      }
-      #${TIMELINE_ID} {
-        position: fixed;
-        right: 0;
-        top: 86px;
-        z-index: 2147482000;
-        width: 28px;
-        max-height: min(520px, calc(100vh - 160px));
-        overflow: auto;
-        padding: 8px 5px;
-        border: 1px solid var(--border-300, rgba(0,0,0,.14));
-        border-right: 0;
-        border-radius: 8px 0 0 8px;
-        background: #ffffff !important;
-        background-color: #ffffff !important;
-        color: var(--text-300, #52525b);
-        font: 12px/16px system-ui, sans-serif;
-        box-shadow: 0 8px 26px rgba(0,0,0,.16);
-        transition: width .16s ease, padding .16s ease;
-        opacity: 1 !important;
-        backdrop-filter: none !important;
-      }
-      #${TIMELINE_ID}:empty {
-        display: none;
-      }
-      #${TIMELINE_ID}:hover,
-      #${TIMELINE_ID}:focus-within {
-        width: 240px;
-        padding: 8px 8px;
-      }
-      #${TIMELINE_ID} button {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        width: 100%;
-        min-height: 24px;
-        margin: 0 0 6px;
-        border: 0;
-        border-radius: 6px;
-        background: transparent;
-        color: inherit;
-        text-align: left;
-        font: inherit;
-        padding: 5px 4px;
-        cursor: default;
-      }
-      #${TIMELINE_ID} button::before {
-        content: "";
-        flex: 0 0 8px;
-        width: 8px;
-        height: 8px;
-        border-radius: 999px;
-        background: currentColor;
-        opacity: .86;
-      }
-      #${TIMELINE_ID} .claude-zh-cn-timeline-summary {
-        display: block;
-        min-width: 0;
-        max-width: 0;
-        overflow: hidden;
-        white-space: nowrap;
-        text-overflow: ellipsis;
-        opacity: 0;
-        transition: max-width .16s ease, opacity .12s ease;
-      }
-      #${TIMELINE_ID}:hover .claude-zh-cn-timeline-summary,
-      #${TIMELINE_ID}:focus-within .claude-zh-cn-timeline-summary {
-        max-width: 200px;
-        opacity: 1;
-      }
-      #${TIMELINE_ID} button:hover,
-      #${TIMELINE_ID} button:focus-visible {
-        background: color-mix(in srgb, var(--text-500, #111827) 8%, transparent);
-        outline: none;
-      }
-      .${CENTERED_CLASS} main,
-      .${CENTERED_CLASS} [role="main"],
-      .${CENTERED_CLASS} form {
-        max-width: var(--claude-zh-cn-centered-width, 980px) !important;
-        margin-left: auto !important;
-        margin-right: auto !important;
-      }
-      #${CENTERED_TOGGLE_ID} {
-        position: fixed;
-        right: 0;
-        bottom: 64px;
-        z-index: 2147483100;
-        border: 1px solid var(--border-300,#ddd);
-        border-radius: 999px;
-        padding: 7px 10px;
-        background: var(--bg-000,#fff);
-        color: inherit;
-        box-shadow: 0 8px 28px rgba(0,0,0,.14);
-        cursor: default;
-        font: 12px/16px system-ui, sans-serif;
-        white-space: nowrap;
-        transform: translateX(calc(100% - 12px));
-        opacity: .62;
-        transition: transform .16s ease, opacity .12s ease, box-shadow .12s ease;
-      }
-      #${CENTERED_TOGGLE_ID}:hover,
-      #${CENTERED_TOGGLE_ID}:focus-visible,
-      #${CENTERED_TOGGLE_ID}[data-centered-dialog-open="true"] {
-        transform: translateX(0);
-        opacity: 1;
-      }
-      .claude-zh-cn-centered-width-dialog {
-        position: fixed;
-        right: 20px;
-        bottom: 108px;
-        z-index: 2147483200;
-        width: 232px;
-        border: 1px solid var(--border-300,#d1d5db);
-        border-radius: 8px;
-        background: #ffffff;
-        color: var(--text-500,#111827);
-        box-shadow: 0 16px 48px rgba(0,0,0,.18);
-        padding: 12px;
-        font: 12px/16px system-ui, sans-serif;
-      }
-      .claude-zh-cn-centered-width-dialog label {
-        display: block;
-        margin-bottom: 8px;
-        font-weight: 600;
-      }
-      .claude-zh-cn-centered-width-dialog input {
-        width: 100%;
-        box-sizing: border-box;
-        border: 1px solid var(--border-300,#d1d5db);
-        border-radius: 6px;
-        padding: 7px 8px;
-        font: 13px/18px system-ui, sans-serif;
-      }
-      .claude-zh-cn-centered-width-dialog-actions {
-        display: flex;
-        justify-content: flex-end;
-        gap: 8px;
-        margin-top: 10px;
-      }
-      .claude-zh-cn-centered-width-dialog button {
-        border: 1px solid var(--border-300,#d1d5db);
-        border-radius: 6px;
-        background: #ffffff;
-        color: inherit;
-        padding: 5px 8px;
-        font: 12px/16px system-ui, sans-serif;
-        cursor: default;
-      }
-    `;
-    document.documentElement.appendChild(style);
-  }
-
-  function rowHref(row) {
-    return row.getAttribute("href") || row.querySelector("a[href]")?.getAttribute("href") || "";
-  }
-
-  function looksLikeChatHref(value) {
-    if (!value) return false;
-    try {
-      const url = new URL(value, window.location.href);
-      return /^\/(chat|conversation|thread|session)\/[A-Za-z0-9_.-]{8,}/i.test(url.pathname);
-    } catch {
-      return /\/(chat|conversation|thread|session)\/[A-Za-z0-9_.-]{8,}/i.test(value);
-    }
-  }
-
-  function rowId(row) {
-    const href = rowHref(row);
-    const explicitId = row.getAttribute("data-app-action-sidebar-thread-id")
-      || row.getAttribute("data-session-id")
-      || row.getAttribute("data-thread-id")
-      || row.getAttribute("data-conversation-id")
-      || row.getAttribute("data-chat-id");
-    if (explicitId) return explicitId;
-    const idMatch = href.match(/(?:chat|conversation|thread|session)(?:\/|=|:|-)([A-Za-z0-9_.-]+)/i);
-    return (idMatch && idMatch[1]) || "";
-  }
-
-  function localSessionId(row) {
-    const values = [
-      rowId(row),
-      rowHref(row),
-      row.getAttribute?.("aria-label"),
-      row.getAttribute?.("title"),
-      row.dataset?.sessionId,
-      row.dataset?.threadId,
-      row.dataset?.conversationId,
-      row.dataset?.chatId,
-      rowVisibleText(row)
-    ];
-    for (const value of values) {
-      const match = String(value || "").match(/\blocal_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i);
-      if (match?.[0]) return match[0];
-    }
-    return "";
-  }
-
-  function currentConversationUuid() {
-    const candidates = [location.pathname, location.href];
-    for (const value of candidates) {
-      const match = String(value || "").match(/(?:chat|conversation|thread|session)\/([A-Za-z0-9_.-]{8,})/i);
-      if (match?.[1]) return match[1];
-    }
-    return "";
-  }
-
-  function hasSidebarAncestor(node) {
-    for (let current = node; current && current !== document.body; current = current.parentElement) {
-      const tag = current.tagName?.toLowerCase?.() || "";
-      if (tag === "aside" || tag === "nav") return true;
-      if (current.getAttribute?.("role") === "navigation") return true;
-      const attrs = [
-        current.getAttribute?.("data-testid"),
-        current.getAttribute?.("data-sidebar"),
-        current.getAttribute?.("aria-label"),
-        typeof current.className === "string" ? current.className : "",
-      ].filter(Boolean).join(" ").toLowerCase();
-      if (/(sidebar|side-bar|navigation|recents|history|chats|conversations|侧边栏|导航|最近|历史|聊天|会话)/.test(attrs)) return true;
-    }
-    return false;
-  }
-
-  function isHistorySectionMarker(text) {
-    const value = String(text || "").trim();
-    return /^(?:最近|历史)(?:\s|$)/.test(value) || /^(?:Recent(?:s| conversations| chats)?|History)\b/i.test(value);
-  }
-
-  function isNonHistorySectionMarker(text) {
-    return /^(项目|Projects|文件|Files|说明|Docs|模型|Models|Gateway|用例|Cases|进度|Progress|上下文|Context|规范|Specs|工具|Tools|个人插件|Personal plugins|第三方|自定义|Custom|选择文件夹|Choose folder)\b/i.test(String(text || "").trim());
-  }
-
-  function panelHasModeTabs(panel) {
-    const text = rowVisibleText(panel).slice(0, 400);
-    return /(协作|Collaborate)/i.test(text) && /(代码|Code)/i.test(text);
-  }
-
-  function looksLikeModeOrToolbarChrome(row, text) {
-    const value = [
-      row.getAttribute?.("aria-label"),
-      row.getAttribute?.("title"),
-      text || rowVisibleText(row)
-    ].filter(Boolean).join(" ");
-    const hasModeWords = /(协作|代码|Collaborate|Code)/i.test(value);
-    const hasModeShortcut = /(?:Ctrl|Cmd|Command)\s*\+\s*[12]/i.test(value);
-    if (!hasModeWords && !hasModeShortcut) return false;
-    if (row.matches?.("[role='tab'],[role='tablist']")) return true;
-    if (row.closest?.("[role='tablist']")) return true;
-    if ((row.querySelectorAll?.("[role='tab'],button,[role='button']")?.length || 0) >= 2 && hasModeWords) return true;
-    return false;
-  }
-
-  function looksLikeProviderIdentity(value) {
-    const normalized = stripInjectedActionText(value)
-      .replace(/\s+/g, " ")
-      .trim();
-    return /(?:^|\s)[^·•\r\n]{1,100}\s*[·•]\s*(?:第三方|Third[\s-]*party|Gateway)/i.test(normalized);
-  }
-
-  function providerIdentityText(row) {
-    return stripInjectedActionText([
-      row?.getAttribute?.("aria-label"),
-      row?.getAttribute?.("title"),
-      row?.innerText,
-      row?.textContent
-    ].filter(Boolean).join(" ")).replace(/\s+/g, " ").trim();
-  }
-
-  function looksLikeThirdPartyProviderToolbar(row, text) {
-    if (rowId(row) || looksLikeChatHref(rowHref(row))) return false;
-    const rawProviderIdentity = looksLikeProviderIdentity(providerIdentityText(row));
-    const value = stripInjectedActionText([
-      row.getAttribute?.("aria-label"),
-      row.getAttribute?.("title"),
-      providerIdentityText(row),
-      text || rowVisibleText(row)
-    ].filter(Boolean).join(" ")).replace(/\s+/g, " ").trim();
-    if (!looksLikeProviderIdentity(value)) return false;
-    if (rawProviderIdentity) return true;
-    return hasNativeRowControl(row)
-      || row.matches?.("[role='heading']")
-      || !!row.querySelector?.("[aria-haspopup],[data-radix-menu-trigger]")
-      || row.getAttribute?.(ROW_FLAG) === "true"
-      || isNearSidebarBottom(row);
-  }
-
-  function isNearSidebarBottom(row) {
-    const panel = row?.closest?.(SIDEBAR_CONTAINER_SELECTORS);
-    const rowRect = row?.getBoundingClientRect?.();
-    const panelRect = panel?.getBoundingClientRect?.();
-    if (rowRect && panelRect && panelRect.height >= 180) {
-      const footerBand = Math.min(180, Math.max(88, panelRect.height * 0.18));
-      if (rowRect.top >= panelRect.bottom - footerBand
-        && rowRect.bottom <= panelRect.bottom + 56) return true;
-    }
-    return isNearViewportSidebarBottom(row);
-  }
-
-  function isNearViewportSidebarBottom(row) {
-    const rowRect = row?.getBoundingClientRect?.();
-    const viewportHeight = Math.max(
-      Number(window.innerHeight) || 0,
-      Number(document.documentElement?.clientHeight) || 0
-    );
-    const viewportWidth = Math.max(
-      Number(window.innerWidth) || 0,
-      Number(document.documentElement?.clientWidth) || 0
-    );
-    if (!rowRect || viewportHeight < 240 || viewportWidth < 480) return false;
-    if (rowRect.width > 620) return false;
-    const footerBand = Math.min(220, Math.max(96, viewportHeight * 0.22));
-    const sidebarBoundary = Math.max(560, viewportWidth * 0.45);
-    return rowRect.left <= sidebarBoundary
-      && rowRect.bottom >= viewportHeight - footerBand
-      && rowRect.top <= viewportHeight + 48;
-  }
-
-  function isViewportSidebarFooterNode(node) {
-    const rect = node?.getBoundingClientRect?.();
-    const viewportHeight = Math.max(
-      Number(window.innerHeight) || 0,
-      Number(document.documentElement?.clientHeight) || 0
-    );
-    const viewportWidth = Math.max(
-      Number(window.innerWidth) || 0,
-      Number(document.documentElement?.clientWidth) || 0
-    );
-    if (!rect || viewportHeight < 240 || viewportWidth < 480) return false;
-    if (rect.width > 620 || rect.right < -48) return false;
-    const footerBand = Math.min(240, Math.max(112, viewportHeight * 0.26));
-    const sidebarBoundary = Math.max(560, viewportWidth * 0.45);
-    return rect.left <= sidebarBoundary
-      && rect.bottom >= viewportHeight - footerBand
-      && rect.top <= viewportHeight + 48;
-  }
-
-  function explicitSessionActionAncestor(node) {
-    for (let current = node; current && current !== document.body; current = current.parentElement) {
-      const rect = current.getBoundingClientRect?.();
-      if (rect && (rect.width > 840 || rect.height > 320)) break;
-      if (rowId(current) || looksLikeChatHref(rowHref(current))) return current;
-    }
-    return null;
-  }
-
-  function sessionActionAncestor(node) {
-    const explicit = explicitSessionActionAncestor(node);
-    if (explicit) return explicit;
-    for (let current = node; current && current !== document.body; current = current.parentElement) {
-      if (current.getAttribute?.(ROW_FLAG) === "true" && looksLikeSidebarSessionRow(current)) return current;
-      const rect = current.getBoundingClientRect?.();
-      if (rect && (rect.width > 840 || rect.height > 320)) break;
-    }
-    return null;
-  }
-
-  function providerToolbarAncestor(row) {
-    for (let current = row; current && current !== document.body; current = current.parentElement) {
-      if (rowId(current) || looksLikeChatHref(rowHref(current))) continue;
-      const value = [
-        current.getAttribute?.("aria-label"),
-        current.getAttribute?.("title"),
-        providerIdentityText(current),
-        rowVisibleText(current)
-      ].filter(Boolean).join(" ");
-      if (looksLikeProviderIdentity(value) && looksLikeThirdPartyProviderToolbar(current, rowVisibleText(current))) {
-        return current;
-      }
-      const rect = current.getBoundingClientRect?.();
-      if (rect && (rect.width > 620 || rect.height > 280)) break;
-    }
-    return null;
-  }
-
-  function hasRecentsSectionHint(panel) {
-    const text = rowVisibleText(panel).slice(0, 1200);
-    return /(?:最近|历史|Recent(?:s| conversations| chats)?|History|聊天|Chat|会话)/i.test(text);
-  }
-
-  function sessionPanelRoots() {
-    const cache = scanCache();
-    if (cache.panelRoots) return cache.panelRoots;
-    const roots = new Set();
-    const addRoot = (panel) => {
-      if (!panel) return;
-      if (hasRecentsSectionHint(panel) || panel.querySelector?.(SESSION_SIGNAL_SELECTORS)) roots.add(panel);
-    };
-    const sidebarContainers = [...document.querySelectorAll(SIDEBAR_CONTAINER_SELECTORS)].filter(visible);
-    sidebarContainers.forEach(addRoot);
-    document.querySelectorAll(SESSION_SIGNAL_SELECTORS).forEach((signal) => {
-      for (let current = signal.parentElement; current && current !== document.body; current = current.parentElement) {
-        const rect = current.getBoundingClientRect?.();
-        if (!rect || rect.width < 160 || rect.height < 120 || rect.width > 840) continue;
-        const signalCount = current.querySelectorAll?.(SESSION_SIGNAL_SELECTORS)?.length || 0;
-        if (current.matches?.(SIDEBAR_CONTAINER_SELECTORS) || signalCount >= 2 || (signalCount >= 1 && rect.left <= Math.max(560, window.innerWidth * 0.45))) {
-          addRoot(current);
-          break;
-        }
-      }
-    });
-    const unresolvedContainers = sidebarContainers.filter((container) => !roots.has(container));
-    unresolvedContainers.forEach((container) => {
-      container.querySelectorAll("button,[role='tab'],[role='button'],a,div").forEach((node) => {
-        const text = rowVisibleText(node);
-        if (!/(最近|历史|Recent|History|聊天|Chat|会话|Conversation)/i.test(text)) return;
-        addRoot(container);
-      });
-    });
-    unresolvedContainers.forEach((container) => {
-      if (roots.has(container)) return;
-      container.querySelectorAll("a[href],button,[role='button'],[role='link'],[role='treeitem'],[role='listitem'],li,div").forEach((node) => {
-        const text = rowVisibleText(node);
-        if (!looksLikeRecentsEntryRow(node, text) && !hasSessionSignal(node) && !isCurrentSidebarItem(node)) return;
-        for (let current = node.parentElement; current && current !== document.body; current = current.parentElement) {
-          const rect = current.getBoundingClientRect?.();
-          if (!rect || rect.width < 160 || rect.height < 120 || rect.left > Math.max(560, window.innerWidth * 0.6)) break;
-          if (current === container || current.matches?.(SIDEBAR_CONTAINER_SELECTORS) || current.querySelector?.(SESSION_SIGNAL_SELECTORS)) {
-            addRoot(current === container ? container : current);
-            break;
-          }
-        }
-      });
-    });
-    cache.panelRoots = [...roots];
-    return cache.panelRoots;
-  }
-
-  function recentSectionRoots() {
-    const cache = scanCache();
-    if (cache.recentSectionRoots) return cache.recentSectionRoots;
-    const roots = [];
-    sessionPanelRoots().forEach((panel) => {
-      const markers = [];
-      for (const node of panel.querySelectorAll("button,[role='button'],[role='heading'],[aria-label],a,div,span")) {
-        if (markers.length >= 3) break;
-        if (!visible(node)) continue;
-        if (node === panel) continue;
-        if (node.querySelector?.(SESSION_SIGNAL_SELECTORS)) continue;
-        const fitsPanel = (() => {
-          const rect = node.getBoundingClientRect?.();
-          const panelRect = panel.getBoundingClientRect?.();
-          return !rect || !panelRect || rect.height < panelRect.height * 0.5;
-        })();
-        if (fitsPanel && isHistorySectionMarker(rowVisibleText(node))) markers.push(node);
-      }
-      if (markers.length) roots.push(...markers.map((marker) => ({ panel, marker })));
-      else roots.push({ panel, marker: null });
-    });
-    cache.recentSectionRoots = roots;
-    return roots;
-  }
-
-  function isInsideRecentsSection(row) {
-    const rect = row.getBoundingClientRect?.();
-    if (!rect) return false;
-    const section = recentSectionRoots().find(({ panel, marker }) => {
-      if (!panel.contains(row)) return false;
-      if (!marker) return true;
-      const markerRect = marker.getBoundingClientRect?.();
-      return markerRect && markerRect.bottom <= rect.top + 1;
-    });
-    if (!section) return false;
-    if (!section.marker) return hasSessionSignal(row);
-    const cache = scanCache();
-    const sectionKey = section.marker;
-    const markerRect = section.marker.getBoundingClientRect?.();
-    if (!markerRect) return false;
-    if (!cache.nonHistoryMarkers) cache.nonHistoryMarkers = new WeakMap();
-    let nodes = cache.nonHistoryMarkers.get(sectionKey);
-    if (!nodes) {
-      nodes = [...section.panel.querySelectorAll("button,[role='button'],[role='heading'],[aria-label],a,div,span")]
-        .filter(visible)
-        .filter((node) => isNonHistorySectionMarker(rowVisibleText(node)));
-      cache.nonHistoryMarkers.set(sectionKey, nodes);
-    }
-    for (const node of nodes) {
-      const nodeRect = node.getBoundingClientRect?.();
-      if (!nodeRect || nodeRect.bottom <= markerRect.bottom + 1 || nodeRect.top >= rect.top - 1) continue;
-      return false;
-    }
-    return true;
-  }
-
-  function looksLikeRecentsEntryRow(row, text) {
-    const title = recentsTitleText(row) || text;
-    if (!title || title.length < 2) return false;
-    if (looksLikeSidebarChrome(row, text)) return false;
-    if (isHistorySectionMarker(title) || isNonHistorySectionMarker(title)) return false;
-    if (!meaningfulRecentsTitle(row, title)) return false;
-    if (row.matches?.("input,textarea,select,[contenteditable='true']")) return false;
-    if (row.querySelector?.("input,textarea,select,[contenteditable='true']")) return false;
-    return true;
-  }
-
-  function hasNativeRowControl(row) {
-    const selector = "button,[role='button'],[aria-haspopup],[data-radix-menu-trigger]";
-    const controls = [];
-    if (row?.matches?.(selector)) controls.push(row);
-    controls.push(...(row?.querySelectorAll?.(selector) || []));
-    return controls
-      .some((node) => !node.classList?.contains(ACTION_BUTTON_CLASS));
-  }
-
-  function isLikelyProjectOrGroupRow(row, text) {
-    if (titleLooksLikeFilePath(text) && !rowId(row) && !looksLikeChatHref(rowHref(row))) return true;
-    if (titleLooksLikeProjectGroup(text) && !rowId(row) && !looksLikeChatHref(rowHref(row))) return true;
-    const label = [
-      row.getAttribute?.("aria-label"),
-      row.getAttribute?.("title")
-    ].filter(Boolean).join(" ");
-    return /(Gateway|第三方|folder|workspace|repo|repository|文件夹|仓库|工作区|警告|warning)/i.test(label)
-      && !rowId(row)
-      && !looksLikeChatHref(rowHref(row));
-  }
-
-  function stripNewSessionCommandChrome(value) {
-    return stripInjectedActionText(value)
-      .replace(/(?:Ctrl|Cmd|Command)\s*\+\s*N/gi, " ")
-      .replace(/[+＋⌘]/g, " ")
-      .replace(/\b(?:Ctrl|Cmd|Command|Alt|Shift|N)\b/gi, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  function looksLikeNewSessionCommand(row, text) {
-    if (rowId(row) || looksLikeChatHref(rowHref(row)) || row.querySelector?.(SESSION_SIGNAL_SELECTORS)) return false;
-    const labels = [
-      row.getAttribute?.("aria-label"),
-      row.getAttribute?.("title"),
-      text
-    ].filter(Boolean);
-    return labels.some((label) => {
-      const value = stripNewSessionCommandChrome(label);
-      const compact = value.replace(/\s+/g, "");
-      return /^(?:新建会话|新建聊天)$/.test(compact)
-        || /^(?:New chat|New session)$/i.test(value);
-    });
-  }
-
-  function titleLooksLikeProjectGroup(text) {
-    return /^(?:Gateway|第三方|Projects?|项目)(?:\s|$)/i.test(String(text || "").trim());
-  }
-
-  function titleLooksLikeFilePath(text) {
-    const value = stripInjectedActionText(text).trim();
-    if (/^[A-Za-z]:[\\/]/.test(value)) return true;
-    if (/^(?:\.{1,2}|~)[\\/]/.test(value)) return true;
-    if (/^[\\/][^\\/]+[\\/]/.test(value)) return true;
-    return /[\\/].+\.(?:c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|json|kt|md|mjs|py|rs|scss|swift|toml|ts|tsx|txt|xml|yaml|yml)$/i.test(value);
-  }
-
-  function isInjectedActionText(value) {
-    return /^(移动|导出|删除|Move|Export|Delete)$/.test(String(value || "").trim());
-  }
-
-  function stripInjectedActionText(value) {
-    return String(value || "")
-      .replace(/\b(Move|Export|Delete)\b/gi, " ")
-      .replace(/移动|导出|删除/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  function meaningfulRecentsTitle(row, text) {
-    const value = stripInjectedActionText(text);
-    if (!value) return false;
-    if (isInjectedActionText(value)) return false;
-    if (/^[•·◦○\u25e6\u25cb\u2022]+$/.test(value)) return false;
-    if (value.length < 3 && !rowId(row) && !looksLikeChatHref(rowHref(row))) return false;
-    if (/^[\p{P}\p{S}\s]+$/u.test(value)) return false;
-    return true;
-  }
-
-  function recentsTitleNodes(row) {
-    if (!row || row.nodeType !== 1) return [];
-    const selectors = [
-      "[data-thread-title]",
-      ".truncate",
-      "[title]"
-    ].join(",");
-    const titles = new Map();
-    [...row.querySelectorAll?.(selectors) || []].forEach((node) => {
-      if (node.classList?.contains(ACTION_BUTTON_CLASS)) return false;
-      if (node.closest?.(`.${ACTION_BUTTON_CLASS},.${PORTAL_BUTTON_CLASS}`)) return false;
-      if (node.matches?.("button,[role='button']")) return false;
-      const title = stripInjectedActionText(node.getAttribute?.("title") || rowVisibleText(node));
-      if (!title) return;
-      if (isInjectedActionText(title)) return;
-      if (looksLikeSidebarChrome(node, title)) return;
-      if (isHistorySectionMarker(title) || isNonHistorySectionMarker(title)) return;
-      if (!meaningfulRecentsTitle(row, title)) return;
-      const key = title.replace(/\s+/g, " ").trim().toLowerCase();
-      if (!titles.has(key)) titles.set(key, node);
-    });
-    return [...titles.values()];
-  }
-
-  function recentsTitleText(row) {
-    const node = recentsTitleNodes(row)[0];
-    if (!node) return "";
-    return stripInjectedActionText(node.getAttribute?.("title") || rowVisibleText(node));
-  }
-
-  function hasReadableRecentsTitle(row) {
-    return recentsTitleNodes(row).length > 0;
-  }
-
-  function hasSessionSignal(row) {
-    return !!rowId(row)
-      || looksLikeChatHref(rowHref(row))
-      || !!row.querySelector?.(SESSION_SIGNAL_SELECTORS);
-  }
-
-  function isCurrentSidebarItem(row) {
-    return row.getAttribute?.("aria-current") === "page"
-      || row.getAttribute?.("aria-current") === "true";
-  }
-
-  function isCurrentRecentsItem(row, text) {
-    return isCurrentSidebarItem(row)
-      && isInsideRecentsSection(row)
-      && !isLikelyProjectOrGroupRow(row, text || rowVisibleText(row));
-  }
-
-  function recentsRowKey(row) {
-    return rowId(row) || rowHref(row) || recentsTitleText(row) || rowVisibleText(row).slice(0, 120);
-  }
-
-  function addCandidateNode(nodes, node) {
-    if (!node || node.nodeType !== 1 || nodes.has(node)) return nodes.size < MAX_RECENTS_CANDIDATE_NODES;
-    if (node.classList?.contains(ACTION_BUTTON_CLASS)) return true;
-    nodes.add(node);
-    return nodes.size < MAX_RECENTS_CANDIDATE_NODES;
-  }
-
-  function fallbackRecentsTextNodes(panel, marker) {
-    const fallback = [];
-    const markerRect = marker?.getBoundingClientRect?.();
-    let visits = 0;
-    const walk = (node) => {
-      if (!node || node.nodeType !== 1) return false;
-      visits += 1;
-      if (visits > MAX_RECENTS_FALLBACK_VISITS || fallback.length >= MAX_RECENTS_CANDIDATE_NODES) return true;
-      const rect = node.getBoundingClientRect?.();
-      if (rect) {
-        if (rect.width > 560 || rect.height > 260) {
-          for (const child of Array.from(node.children || [])) {
-            if (walk(child)) return true;
-          }
-          return false;
-        }
-        if (markerRect && rect.top <= markerRect.bottom) return false;
-      }
-      const text = rowVisibleText(node);
-      if ((hasReadableRecentsTitle(node) || looksLikeRecentsEntryRow(node, text) || isCurrentSidebarItem(node)) && !isHistorySectionMarker(text) && !isNonHistorySectionMarker(text)) fallback.push(node);
-      for (const child of Array.from(node.children || [])) {
-        if (walk(child)) return true;
-      }
-      return false;
-    };
-    walk(panel);
-    return fallback;
-  }
-
-  function candidateNodesForSection(panel, marker) {
-    const nodes = new Set();
-    for (const node of panel.querySelectorAll(ROW_SELECTORS)) {
-      if (!addCandidateNode(nodes, node)) break;
-    }
-    if (nodes.size < MAX_RECENTS_CANDIDATE_NODES) {
-      for (const node of panel.querySelectorAll("[data-thread-title],.truncate,[title],li,[role='listitem'],[role='treeitem']")) {
-        if (!addCandidateNode(nodes, node)) break;
-      }
-    }
-    if (nodes.size < MAX_RECENTS_CANDIDATE_NODES) fallbackRecentsTextNodes(panel, marker).forEach((node) => addCandidateNode(nodes, node));
-    return [...nodes];
-  }
-
-  function preferRecentsRow(existing, next) {
-    if (!existing) return next;
-    if (!next) return existing;
-    if (next.contains?.(existing)) return next;
-    if (existing.contains?.(next)) return existing;
-    const existingSignal = (hasSessionSignal(existing) ? 4 : 0) + (hasReadableRecentsTitle(existing) ? 2 : 0) + (existing.matches?.("li,[role='listitem'],[role='treeitem']") ? 1 : 0);
-    const nextSignal = (hasSessionSignal(next) ? 4 : 0) + (hasReadableRecentsTitle(next) ? 2 : 0) + (next.matches?.("li,[role='listitem'],[role='treeitem']") ? 1 : 0);
-    if (nextSignal !== existingSignal) return nextSignal > existingSignal ? next : existing;
-    const existingInteractive = existing.matches?.("a[href],button,[role='button']") ? 1 : 0;
-    const nextInteractive = next.matches?.("a[href],button,[role='button']") ? 1 : 0;
-    if (nextInteractive !== existingInteractive) return nextInteractive < existingInteractive ? next : existing;
-    const existingRect = existing.getBoundingClientRect?.();
-    const nextRect = next.getBoundingClientRect?.();
-    const existingArea = existingRect ? existingRect.width * existingRect.height : 0;
-    const nextArea = nextRect ? nextRect.width * nextRect.height : 0;
-    return nextArea > existingArea ? next : existing;
-  }
-
-  function isBlankOrStatusDotRow(row, text) {
-    const value = stripInjectedActionText(text || rowVisibleText(row));
-    if (!value) return true;
-    if (/^[•·◦○\u25e6\u25cb\u2022]+$/.test(value)) return true;
-    return false;
-  }
-
-  function recentsRowContainer(node) {
-    const selectors = "[data-app-action-sidebar-thread-id],[data-session-id],[data-thread-id],[data-conversation-id],[data-chat-id],a[href],button,[role='button'],[role='link'],[role='treeitem'],[role='listitem'],li";
-    const direct = node.closest?.(selectors);
-    if (direct) {
-      const directText = rowVisibleText(direct);
-      if (direct.matches?.("button,[role='button']") && !rowId(direct) && !looksLikeChatHref(rowHref(direct))) return node;
-      if (hasReadableRecentsTitle(direct) || rowId(direct) || looksLikeChatHref(rowHref(direct)) || isCurrentRecentsItem(direct, directText)) return direct;
-    }
-    let best = node;
-    for (let current = node; current && current !== document.body; current = current.parentElement) {
-      if (current.matches?.("button,[role='button']") && !rowId(current) && !looksLikeChatHref(rowHref(current))) continue;
-      const rect = current.getBoundingClientRect?.();
-      if (!rect || rect.width < 120 || rect.width > 440 || rect.height < 16 || rect.height > 240) continue;
-      const candidateText = rowVisibleText(current);
-      if (isHistorySectionMarker(candidateText) || isNonHistorySectionMarker(candidateText)) continue;
-      if (!hasReadableRecentsTitle(current) && !rowId(current) && !looksLikeChatHref(rowHref(current)) && !isCurrentRecentsItem(current, candidateText) && !looksLikeRecentsEntryRow(current, candidateText)) continue;
-      const bestRect = best.getBoundingClientRect?.();
-      const candidateRect = rect;
-      if (!bestRect || candidateRect.width > bestRect.width) best = current;
-      if (candidateRect.width >= 180) return current;
-    }
-    return best;
-  }
-
-  function normalizeRecentsRow(row) {
-    if (!row || row.nodeType !== 1) return row;
-    let best = row;
-    for (let current = row; current && current !== document.body; current = current.parentElement) {
-      const rect = current.getBoundingClientRect?.();
-      if (!rect || rect.width < 120 || rect.width > 560 || rect.height < 16 || rect.height > 240) continue;
-      const text = rowVisibleText(current);
-      if (isHistorySectionMarker(text) || isNonHistorySectionMarker(text) || isLikelyProjectOrGroupRow(current, text)) continue;
-      if (!hasSessionSignal(current) && !hasReadableRecentsTitle(current) && !looksLikeRecentsEntryRow(current, text)) continue;
-      best = current;
-      if (current.matches?.("[data-app-action-sidebar-thread-id],[data-session-id],[data-thread-id],[data-conversation-id],[data-chat-id],[role='treeitem'],[role='listitem'],li")) break;
-    }
-    return best;
-  }
-
-  function looksLikeSidebarSessionRow(row) {
-    return sessionRowRejectReason(row) === "";
-  }
-
-  function sessionRowRejectReason(row) {
-    if (!row || row.nodeType !== 1) return "invalid";
-    const rect = row.getBoundingClientRect?.();
-    if (!rect || rect.width <= 0 || rect.height <= 0) return "invisible";
-    const text = rowVisibleText(row);
-    const title = recentsTitleText(row);
-    const titleOrText = title || text;
-    const isCurrentConversation = isCurrentRecentsItem(row, text);
-    const hasConversationSignal = hasSessionSignal(row) || isCurrentConversation;
-    if (isBlankOrStatusDotRow(row, text)) return "blank-or-dot";
-    if (looksLikeThirdPartyProviderToolbar(row, text) || providerToolbarAncestor(row)) return "third-party-provider-toolbar";
-    if (looksLikeModeOrToolbarChrome(row, text)) return "mode-or-toolbar";
-    if (looksLikeNewSessionCommand(row, text)) return "new-session-command";
-    if (!hasConversationSignal && looksLikeSidebarChrome(row, text)) return "sidebar-chrome";
-    if (!hasSidebarAncestor(row) && !sessionPanelRoots().some((panel) => panel.contains(row))) return "outside-session-panel";
-    if (rect.width > 560) return "too-wide";
-    if (rect.height < 16) return "too-short";
-    if (rect.height > 240) return "too-tall";
-    if (!titleOrText) return "missing-title";
-    if (!hasConversationSignal && isLikelyProjectOrGroupRow(row, text)) return "project-or-group";
-    if (!hasConversationSignal && !looksLikeRecentsEntryRow(row, text)) return "not-session-title";
-    if (!isInsideRecentsSection(row)) return "outside-recents-section";
-    return "";
-  }
-
-  function rowVisibleText(row) {
-    if (!row) return "";
-    const cached = visibleTextCache.get(row);
-    if (cached !== undefined) return cached;
-    const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT, {
-      acceptNode(node) {
-        const value = String(node.nodeValue || "").replace(/\s+/g, " ").trim();
-        if (!value) return NodeFilter.FILTER_REJECT;
-        const parent = node.parentElement;
-        if (!parent) return NodeFilter.FILTER_REJECT;
-        if (parent.closest?.(`.${ACTION_BUTTON_CLASS},.${TOOLTIP_CLASS},.${TOAST_CLASS},.${PORTAL_BUTTON_CLASS},[aria-hidden="true"],[hidden]`)) return NodeFilter.FILTER_REJECT;
-        const style = window.getComputedStyle?.(parent);
-        if (style && (style.display === "none" || style.visibility === "hidden")) return NodeFilter.FILTER_REJECT;
-        const rect = parent.getBoundingClientRect?.();
-        if (rect && (rect.width <= 0 || rect.height <= 0)) return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_ACCEPT;
-      }
-    });
-    const parts = [];
-    for (let node = walker.nextNode(); node; node = walker.nextNode()) parts.push(node.nodeValue);
-    const value = stripInjectedActionText(parts.join(" ")).replace(/\s+/g, " ").trim();
-    if (visibleTextCacheSize < TEXT_CACHE_LIMIT) {
-      visibleTextCache.set(row, value);
-      visibleTextCacheSize += 1;
-    }
-    return value;
-  }
-
-  function looksLikeSidebarChrome(row, text) {
-    const label = [
-      row.getAttribute?.("aria-label"),
-      row.getAttribute?.("title"),
-      text
-    ].filter(Boolean).join(" ");
-    return /new chat|search|settings|help|upgrade|profile|account|view\s*all|show\s*more|show\s*less|expand|collapse|新建|搜索|设置|帮助|升级|账户|个人资料|查看\s*全部|展开|收起|折叠/i.test(label);
-  }
-
-  function rowTitle(row) {
-    const titleNode = row.querySelector("[data-thread-title], .truncate, [title]");
-    return (
-      titleNode?.getAttribute("title")
-      || titleNode?.textContent
-      || row.getAttribute("aria-label")
-      || row.textContent
-      || "当前会话"
-    ).replace(/\s*(删除|Delete|导出|Export|移动|Move|归档|Archive|更多|More)\s*$/g, "").trim().slice(0, 120);
-  }
-
-  function visible(node) {
-    const rect = node?.getBoundingClientRect?.();
-    return !!rect && rect.width > 0 && rect.height > 0;
-  }
-
-  function mainRoot() {
-    return document.querySelector("main,[role='main']") || document.body;
-  }
-
-  function isCurrentRow(row) {
-    if (row.getAttribute("aria-current") === "page" || row.getAttribute("aria-current") === "true") return true;
-    const href = rowHref(row);
-    if (!href) return false;
-    try {
-      const url = new URL(href, window.location.href);
-      return url.href === window.location.href || url.pathname === window.location.pathname;
-    } catch {
-      return window.location.href.includes(href);
-    }
-  }
-
-  function stopButtonEvent(event) {
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation?.();
-  }
-
-  function hideTooltip() {
-    document.querySelectorAll(`.${TOOLTIP_CLASS}`).forEach((node) => node.remove());
-  }
-
-  function showTooltip(button, text) {
-    hideTooltip();
-    const tooltip = document.createElement("div");
-    tooltip.className = TOOLTIP_CLASS;
-    tooltip.textContent = text || button.getAttribute("aria-label") || "操作";
-    document.body.appendChild(tooltip);
-    const buttonRect = button.getBoundingClientRect();
-    const tooltipRect = tooltip.getBoundingClientRect();
-    tooltip.style.left = `${Math.max(8, Math.min(window.innerWidth - tooltipRect.width - 8, buttonRect.left + buttonRect.width / 2 - tooltipRect.width / 2))}px`;
-    tooltip.style.top = `${Math.max(8, buttonRect.bottom + 8)}px`;
-  }
-
-  function showToast(message) {
-    document.querySelectorAll(`.${TOAST_CLASS}`).forEach((node) => node.remove());
-    const toast = document.createElement("div");
-    toast.className = TOAST_CLASS;
-    toast.textContent = message;
-    document.body.appendChild(toast);
-    setTimeout(() => toast.remove(), 4200);
-  }
-
-  function showUndoToast(message, onUndo) {
-    document.querySelectorAll(`.${TOAST_CLASS}`).forEach((node) => node.remove());
-    const toast = document.createElement("div");
-    toast.className = TOAST_CLASS;
-    const text = document.createElement("span");
-    text.textContent = message;
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = "撤销";
-    button.addEventListener("click", (event) => {
-      stopButtonEvent(event);
-      toast.remove();
-      onUndo?.();
-    }, true);
-    toast.appendChild(text);
-    toast.appendChild(button);
-    document.body.appendChild(toast);
-    setTimeout(() => toast.remove(), 4600);
-  }
-
-  function trashIconSvg() {
-    return `
-      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M3 6h18"></path>
-        <path d="M8 6V4h8v2"></path>
-        <path d="M19 6l-1 14H6L5 6"></path>
-        <path d="M10 11v5"></path>
-        <path d="M14 11v5"></path>
-      </svg>
-    `;
-  }
-
-  function exportIconSvg() {
-    return `
-      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M12 3v12"></path>
-        <path d="m7 10 5 5 5-5"></path>
-        <path d="M5 21h14"></path>
-      </svg>
-    `;
-  }
-
-  function moveIconSvg() {
-    return `
-      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M3 7h6l2 2h10v10H3z"></path>
-        <path d="M14 13h5"></path>
-        <path d="m17 10 3 3-3 3"></path>
-      </svg>
-    `;
-  }
-
-  function ensurePortalButton() {
-    const existing = document.querySelector(`.${BUTTON_CLASS}.${PORTAL_BUTTON_CLASS}`);
-    if (existing?.dataset.sessionDeleteVersion === VERSION) {
-      portalButton = existing;
-      return existing;
-    }
-    existing?.remove();
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `${ACTION_BUTTON_CLASS} ${BUTTON_CLASS} ${PORTAL_BUTTON_CLASS}`;
-    button.dataset.sessionDeleteVersion = VERSION;
-    button.setAttribute("aria-label", "删除");
-    button.innerHTML = trashIconSvg();
-    ["pointerdown", "mousedown", "mouseup", "touchstart"].forEach((eventName) => {
-      button.addEventListener(eventName, stopButtonEvent, true);
-    });
-    button.addEventListener("pointerenter", () => {
-      clearTimeout(hidePortalTimer);
-      showTooltip(button, "删除");
-    });
-    button.addEventListener("pointerleave", () => scheduleHidePortal());
-    button.addEventListener("focus", () => showTooltip(button));
-    button.addEventListener("blur", () => scheduleHidePortal());
-    button.addEventListener("click", (event) => {
-      if (activeRow) activateDelete(activeRow, event);
-      else stopButtonEvent(event);
-    }, true);
-    document.body.appendChild(button);
-    portalButton = button;
-    return button;
-  }
-
-  function cleanupPortalButton() {
-    document.querySelectorAll(`.${BUTTON_CLASS}.${PORTAL_BUTTON_CLASS}`).forEach((node) => node.remove());
-    portalButton = null;
-    activeRow = null;
-  }
-
-  function positionPortalButton(row) {
-    const button = ensurePortalButton();
-    const rect = row.getBoundingClientRect?.();
-    if (!rect) return;
-    const left = Math.max(8, Math.min(window.innerWidth - 34, rect.right - 34));
-    const top = Math.max(8, Math.min(window.innerHeight - 34, rect.top + rect.height / 2 - 13));
-    button.style.left = `${left}px`;
-    button.style.top = `${top}px`;
-    button.dataset.visible = "true";
-    activeRow = row;
-  }
-
-  function hidePortalButton() {
-    hideTooltip();
-    if (portalButton) portalButton.dataset.visible = "false";
-    activeRow = null;
-  }
-
-  function scheduleHidePortal() {
-    clearTimeout(hidePortalTimer);
-    hidePortalTimer = setTimeout(() => {
-      const hoveredRow = activeRow?.matches?.(":hover");
-      const hoveredButton = portalButton?.matches?.(":hover");
-      if (!hoveredRow && !hoveredButton) hidePortalButton();
-    }, 120);
-  }
-
-  function bindPortalHover(row) {
-    if (row.dataset.claudeZhCnDeleteHoverBound === VERSION) return;
-    row.dataset.claudeZhCnDeleteHoverBound = VERSION;
-    row.addEventListener("pointerenter", () => {
-      clearTimeout(hidePortalTimer);
-      positionPortalButton(row);
-    });
-    row.addEventListener("pointermove", () => positionPortalButton(row));
-    row.addEventListener("pointerleave", () => scheduleHidePortal());
-    row.addEventListener("focusin", () => positionPortalButton(row));
-    row.addEventListener("focusout", () => scheduleHidePortal());
-  }
-
-  function menuCandidateText(node) {
-    return [
-      node.getAttribute?.("aria-label"),
-      node.getAttribute?.("title"),
-      node.getAttribute?.("aria-keyshortcuts"),
-      node.dataset?.state,
-      node.textContent
-    ].filter(Boolean).join(" ").trim();
-  }
-
-  function isNativeDeleteControl(node) {
-    const text = menuCandidateText(node);
-    if (!/(delete|remove|删除)/i.test(text)) return false;
-    if (/(deleted|delete older|remove from|archive|归档|较旧)/i.test(text)) return false;
-    if (node.matches?.("[role='menuitem'],[role='option'],button,[cmdk-item]")) return true;
-    return /(^|\s|>)(delete|remove|删除)\s*(?:$|\b|D\b|⌘D|Ctrl\+D)/i.test(text);
-  }
-
-  function isMenuTrigger(node) {
-    const text = menuCandidateText(node).toLowerCase();
-    return /more|options|menu|ellipsis|conversation options|chat options|更多|选项|菜单|会话选项|聊天选项|⋯|…/.test(text)
-      || (node.textContent || "").trim() === "..."
-      || (node.textContent || "").trim() === "⋯";
-  }
-
-  function possibleNativeControls(row) {
-    return [...row.querySelectorAll("button,[role='button'],[aria-label],[title],[tabindex]:not([tabindex='-1'])")]
-      .filter((node) => !node.classList.contains(ACTION_BUTTON_CLASS));
-  }
-
-  function clickNode(node) {
-    ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((type) => {
-      node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-    });
-  }
-
-  function revealRowActions(row) {
-    ["pointerover", "pointerenter", "mouseover", "mouseenter"].forEach((type) => {
-      row.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-    });
-  }
-
-  function dispatchContextMenu(row) {
-    const rect = row.getBoundingClientRect?.();
-    const clientX = rect ? Math.max(1, Math.round(rect.left + Math.min(rect.width - 8, Math.max(8, rect.width - 32)))) : 12;
-    const clientY = rect ? Math.max(1, Math.round(rect.top + rect.height / 2)) : 12;
-    row.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, view: window, button: 2, buttons: 2, clientX, clientY }));
-    row.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window, button: 2, buttons: 2, clientX, clientY }));
-    row.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, view: window, button: 2, buttons: 2, clientX, clientY }));
-    row.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window, button: 2, buttons: 0, clientX, clientY }));
-  }
-
-  function clickDialogConfirm() {
-    const dialogs = [...document.querySelectorAll("[role='dialog'],[data-radix-dialog-content],div")].filter((node) => {
-      const text = node.textContent || "";
-      return visible(node) && /(delete|remove|删除)/i.test(text);
-    });
-    for (const dialog of dialogs) {
-      const buttons = [...dialog.querySelectorAll("button,[role='button']")].filter(visible);
-      const confirm = buttons.find((button) => /(delete|remove|确认|删除)/i.test(menuCandidateText(button)));
-      if (confirm) {
-        clickNode(confirm);
-        return true;
-      }
-    }
-    return false;
-  }
-
-  function clickDeleteMenuItem() {
-    const menus = [...document.querySelectorAll("[role='menu'],[data-radix-menu-content],[cmdk-list],body")];
-    for (const menu of menus) {
-      const item = [...menu.querySelectorAll("button,[role='menuitem'],[role='option'],[cmdk-item],div")]
-        .filter(visible)
-        .find(isNativeDeleteControl);
-      if (item) {
-        clickNode(item);
-        setTimeout(clickDialogConfirm, 160);
-        setTimeout(clickDialogConfirm, 420);
-        return true;
-      }
-    }
-    return false;
-  }
-
-  async function tryNativeDelete(row) {
-    revealRowActions(row);
-    await new Promise((resolve) => setTimeout(resolve, 120));
-    const directDelete = possibleNativeControls(row).find((node) => isNativeDeleteControl(node));
-    if (directDelete) {
-      clickNode(directDelete);
-      setTimeout(clickDialogConfirm, 160);
-      return true;
-    }
-
-    const triggers = possibleNativeControls(row).filter(isMenuTrigger);
-    for (const trigger of triggers) {
-      clickNode(trigger);
-      for (const delay of [80, 180, 360, 700]) {
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        if (clickDeleteMenuItem()) return true;
-      }
-    }
-    dispatchContextMenu(row);
-    for (const delay of [80, 180, 360, 700, 1100]) {
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      if (clickDeleteMenuItem()) return true;
-    }
-    return false;
-  }
-
-  function localDeleteBridgeReady() {
-    return !!globalThis[LOCAL_DELETE_BRIDGE]?.enabled;
-  }
-
-  async function tryLocalSessionDelete(row) {
-    const sessionId = localSessionId(row);
-    if (!sessionId) return { ok: false, error: "不是本地会话" };
-    if (!localDeleteBridgeReady()) return { ok: false, error: "本地删除桥未运行" };
-
-    const requestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    globalThis[LOCAL_DELETE_QUEUE] = Array.isArray(globalThis[LOCAL_DELETE_QUEUE]) ? globalThis[LOCAL_DELETE_QUEUE] : [];
-    globalThis[LOCAL_DELETE_RESULTS] = globalThis[LOCAL_DELETE_RESULTS] || {};
-    globalThis[LOCAL_DELETE_QUEUE].push({
-      requestId,
-      sessionId,
-      title: rowTitle(row),
-      href: rowHref(row)
-    });
-
-    const deadline = Date.now() + 12000;
-    while (Date.now() < deadline) {
-      const result = globalThis[LOCAL_DELETE_RESULTS]?.[requestId];
-      if (result) {
-        delete globalThis[LOCAL_DELETE_RESULTS][requestId];
-        return result;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 240));
-    }
-    return { ok: false, sessionId, error: "本地删除桥无响应" };
-  }
-
-  function escapeHtml(value) {
-    return String(value)
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#39;");
-  }
-
-  function confirmDelete(title) {
-    document.querySelectorAll(".claude-zh-cn-session-delete-confirm-overlay").forEach((node) => node.remove());
-    return new Promise((resolve) => {
-      const overlay = document.createElement("div");
-      overlay.className = "claude-zh-cn-session-delete-confirm-overlay";
-      overlay.innerHTML = `
-        <div class="claude-zh-cn-session-delete-confirm-content" role="dialog" aria-modal="true" aria-label="删除会话">
-          <div class="claude-zh-cn-session-delete-confirm-title">删除会话</div>
-          <div class="claude-zh-cn-session-delete-confirm-message">删除“${escapeHtml(title || "当前会话")}”？</div>
-          <div class="claude-zh-cn-session-delete-confirm-actions">
-            <button type="button" data-claude-delete-cancel>取消</button>
-            <button type="button" data-claude-delete-confirm>删除</button>
-          </div>
-        </div>
-      `;
-      const finish = (value, event) => {
-        event?.preventDefault();
-        event?.stopPropagation();
-        overlay.remove();
-        resolve(value);
-      };
-      overlay.addEventListener("click", (event) => {
-        if (event.target === overlay || event.target.closest("[data-claude-delete-cancel]")) finish(false, event);
-        if (event.target.closest("[data-claude-delete-confirm]")) finish(true, event);
-      }, true);
-      overlay.addEventListener("keydown", (event) => {
-        if (event.key === "Escape") finish(false, event);
-      }, true);
-      document.body.appendChild(overlay);
-      overlay.querySelector("[data-claude-delete-cancel]")?.focus();
-    });
-  }
-
-  async function activateDelete(row, event) {
-    stopButtonEvent(event);
-    hideTooltip();
-    const title = rowTitle(row);
-    if (!(await confirmDelete(title))) return;
-    clearTimeout(pendingDeleteTimer);
-    row.dataset.claudeZhCnPendingDelete = "true";
-    showUndoToast(`已删除“${title || "当前会话"}”`, () => {
-      clearTimeout(pendingDeleteTimer);
-      pendingDeleteTimer = 0;
-      row.dataset.claudeZhCnPendingDelete = "false";
-      showToast("已恢复");
-    });
-    pendingDeleteTimer = setTimeout(async () => {
-      pendingDeleteTimer = 0;
-      const localId = localSessionId(row);
-      if (localId && localDeleteBridgeReady()) {
-        const localDeleted = await tryLocalSessionDelete(row);
-        if (localDeleted?.ok) {
-          showToast("本地会话已移入隔离目录");
-          if (isCurrentRow(row)) setTimeout(() => window.dispatchEvent(new Event("resize")), 300);
-          return;
-        }
-        row.dataset.claudeZhCnPendingDelete = "false";
-        showToast(localDeleted?.error || "本地会话删除失败");
-        return;
-      }
-
-      const nativeDeleted = await tryNativeDelete(row);
-      if (nativeDeleted) {
-        if (isCurrentRow(row)) setTimeout(() => window.dispatchEvent(new Event("resize")), 300);
-        return;
-      }
-
-      if (localId) {
-        const localDeleted = await tryLocalSessionDelete(row);
-        if (localDeleted?.ok) {
-          showToast("本地会话已移入隔离目录");
-          if (isCurrentRow(row)) setTimeout(() => window.dispatchEvent(new Event("resize")), 300);
-          return;
-        }
-        row.dataset.claudeZhCnPendingDelete = "false";
-        showToast(localDeleted?.error || "本地会话删除失败");
-        return;
-      }
-
-      row.dataset.claudeZhCnPendingDelete = "false";
-      showToast("未找到 Claude 自带删除入口");
-    }, 4000);
-  }
-
-  function messageNodes() {
-    const root = mainRoot();
-    const selectors = [
-      "[data-testid*='message']",
-      "[data-message-author-role]",
-      "[data-author]",
-      "[data-testid*='human']",
-      "[data-testid*='prompt']",
-      "[data-testid*='question']",
-      "[data-testid*='request']",
-      "[data-testid*='assistant']",
-      "[data-testid*='response']",
-      "[data-testid*='answer']",
-      "[data-testid*='user']",
-      "[class*='font-claude-message']",
-      "[class*='claude-message']",
-      "[class*='human-message']",
-      "[class*='user-message']",
-      "[class*='prompt-message']",
-      "[class*='claude-response']",
-      "[class*='assistant']",
-      "[class*='response']",
-      "[class*='markdown']",
-      "[class*='prose']",
-      "[data-is-streaming]",
-      "[class*='message']",
-      "article",
-      "[role='listitem']"
-    ].join(",");
-    return [...root.querySelectorAll(selectors)].filter((node) => {
-      if (!visible(node)) return false;
-      if (node.closest?.("aside,nav,[role='navigation']")) return false;
-      if (node.querySelector?.("[data-message-author-role],[data-author]") && !messageRoleSignal(node)) return false;
-      const text = rowVisibleText(node);
-      return text.length >= 2 && text.length <= 20000;
-    });
-  }
-
-  function messageRoleSignal(node) {
-    const carrier = node.closest?.("[data-message-author-role],[data-author],[data-testid*='message'],article,[role='listitem']") || node;
-    const data = [
-      carrier.getAttribute?.("data-message-author-role"),
-      carrier.getAttribute?.("data-author"),
-      carrier.getAttribute?.("aria-label"),
-      typeof carrier.className === "string" ? carrier.className : "",
-      node.getAttribute?.("data-message-author-role"),
-      node.getAttribute?.("data-author"),
-      node.getAttribute?.("data-testid"),
-      node.getAttribute?.("aria-label"),
-      typeof node.className === "string" ? node.className : ""
-    ].filter(Boolean).join(" ").toLowerCase();
-    if (/user|human|you|我|用户/.test(data)) return "用户";
-    if (/assistant|claude|model|助手/.test(data)) return "Claude";
-    return "";
-  }
-
-  function isAssistantContentNode(node) {
-    const data = [
-      node.getAttribute?.("data-testid"),
-      node.getAttribute?.("data-is-streaming"),
-      node.getAttribute?.("aria-label"),
-      typeof node.className === "string" ? node.className : ""
-    ].filter(Boolean).join(" ").toLowerCase();
-    return /assistant|claude|model|response|answer|markdown|prose|streaming|助手|回复/.test(data);
-  }
-
-  function messageRole(node) {
-    const signal = messageRoleSignal(node);
-    if (signal) return signal;
-    if (isAssistantContentNode(node)) return "Claude";
-    const text = rowVisibleText(node).slice(0, 80);
-    if (/^(you|你|我)[:：]/i.test(text)) return "用户";
-    if (/^claude[:：]/i.test(text)) return "Claude";
-    return "";
-  }
-
-  function currentConversationTitle() {
-    const heading = mainRoot().querySelector?.("h1") || document.querySelector("h1");
-    return (heading?.textContent || document.title || "Claude 会话").replace(/\s+/g, " ").trim();
-  }
-
-  function buildConversationMarkdown() {
-    const title = currentConversationTitle();
-    const parts = [`# ${title}`, "", `导出时间：${new Date().toLocaleString()}`, ""];
-    const nodes = messageNodes();
-    const seen = new Set();
-    let lastRole = "";
-    nodes.forEach((node) => {
-      const text = rowVisibleText(node);
-      if (!text || seen.has(text)) return;
-      seen.add(text);
-      let role = messageRole(node);
-      if (!role && lastRole === "用户") role = "Claude";
-      role = role || "消息";
-      lastRole = role;
-      parts.push(`## ${role}`, "", text, "");
-    });
-    if (parts.length <= 4) {
-      const fallback = rowVisibleText(mainRoot());
-      if (fallback) parts.push("## 内容", "", fallback, "");
-    }
-    return parts.join("\n").replace(/\n{4,}/g, "\n\n\n");
-  }
-
-  function safeFileName(value) {
-    return String(value || "Claude 会话")
-      .replace(/[\\/:*?"<>|]+/g, "-")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 80) || "Claude 会话";
-  }
-
-  function timestampForFile() {
-    const pad = (value) => String(value).padStart(2, "0");
-    const date = new Date();
-    return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
-  }
-
-  function downloadMarkdown(markdown) {
-    const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `${safeFileName(currentConversationTitle())}-${timestampForFile()}.md`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }
-
-  function activateExport(row, event) {
-    stopButtonEvent(event);
-    hideTooltip();
-    downloadMarkdown(buildConversationMarkdown());
-    showToast(`已导出：${rowTitle(row) || currentConversationTitle()}`);
-  }
-
-  function isNativeMoveControl(node) {
-    return /move|project|移动|移至|项目/i.test(menuCandidateText(node));
-  }
-
-  function discoverOrganizationUuid() {
-    const patterns = [
-      /\/api\/organizations\/([0-9a-f-]{12,})/i,
-      /"activeOrganization"\s*:\s*\{[^}]*"uuid"\s*:\s*"([0-9a-f-]{12,})"/i,
-      /"organization_uuid"\s*:\s*"([0-9a-f-]{12,})"/i,
-      /"orgUuid"\s*:\s*"([0-9a-f-]{12,})"/i
-    ];
-    const sources = [location.href, document.documentElement.innerHTML.slice(0, 300000)];
-    for (const storage of [localStorage, sessionStorage]) {
-      for (let index = 0; index < storage.length; index += 1) {
-        const key = storage.key(index);
-        if (!key) continue;
-        const value = storage.getItem(key) || "";
-        if (/org|organization|account|user|auth/i.test(key + value.slice(0, 200))) sources.push(`${key}:${value}`);
-      }
-    }
-    for (const source of sources) {
-      for (const pattern of patterns) {
-        const match = source.match(pattern);
-        if (match?.[1]) return match[1];
-      }
-    }
-    return "";
-  }
-
-  async function fetchProjects(orgUuid) {
-    const params = new URLSearchParams({
-      include_harmony_projects: "true",
-      limit: "100",
-      offset: "0",
-      order_by: "updated_at"
-    });
-    const response = await fetch(`/api/organizations/${orgUuid}/projects?${params}`, {
-      credentials: "include",
-      headers: { "Accept": "application/json" }
-    });
-    if (!response.ok) throw new Error(`projects ${response.status}`);
-    const data = await response.json();
-    const projects = Array.isArray(data) ? data : Array.isArray(data.data) ? data.data : Array.isArray(data.projects) ? data.projects : [];
-    return projects
-      .filter((project) => project && !project.archived_at && project.uuid && project.name)
-      .map((project) => ({ uuid: project.uuid, name: project.name }));
-  }
-
-  async function moveConversationToProject(conversationUuid, projectUuid) {
-    const orgUuid = discoverOrganizationUuid();
-    if (!orgUuid) throw new Error("missing organization uuid");
-    const response = await fetch(`/api/organizations/${orgUuid}/chat_conversations/move_many`, {
-      method: "POST",
-      credentials: "include",
-      headers: {
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ conversation_uuids: [conversationUuid], project_uuid: projectUuid || null })
-    });
-    if (!response.ok) throw new Error(`move ${response.status}`);
-    return response.json();
-  }
-
-  function showMoveDialog(row, projects) {
-    document.querySelectorAll(".claude-zh-cn-session-delete-confirm-overlay").forEach((node) => node.remove());
-    return new Promise((resolve) => {
-      const overlay = document.createElement("div");
-      overlay.className = "claude-zh-cn-session-delete-confirm-overlay";
-      const buttons = [
-        `<button type="button" data-claude-move-project="">普通对话</button>`,
-        ...projects.map((project) => `<button type="button" data-claude-move-project="${escapeHtml(project.uuid)}">${escapeHtml(project.name)}</button>`)
-      ].join("");
-      overlay.innerHTML = `
-        <div class="claude-zh-cn-session-delete-confirm-content" role="dialog" aria-modal="true" aria-label="移动会话">
-          <div class="claude-zh-cn-session-delete-confirm-title">移至项目</div>
-          <div class="claude-zh-cn-session-delete-confirm-message">移动“${escapeHtml(rowTitle(row) || "当前会话")}”</div>
-          <div class="claude-zh-cn-session-move-list">${buttons}</div>
-          <div class="claude-zh-cn-session-delete-confirm-actions">
-            <button type="button" data-claude-delete-cancel>取消</button>
-          </div>
-        </div>
-      `;
-      const finish = (value, event) => {
-        event?.preventDefault();
-        event?.stopPropagation();
-        overlay.remove();
-        resolve(value);
-      };
-      overlay.addEventListener("click", (event) => {
-        const moveButton = event.target.closest("[data-claude-move-project]");
-        if (moveButton) finish(moveButton.getAttribute("data-claude-move-project") || null, event);
-        if (event.target === overlay || event.target.closest("[data-claude-delete-cancel]")) finish(undefined, event);
-      }, true);
-      overlay.addEventListener("keydown", (event) => {
-        if (event.key === "Escape") finish(undefined, event);
-      }, true);
-      document.body.appendChild(overlay);
-      overlay.querySelector("[data-claude-move-project]")?.focus();
-    });
-  }
-
-  async function tryNativeMove(row) {
-    revealRowActions(row);
-    await new Promise((resolve) => setTimeout(resolve, 120));
-    const directMove = possibleNativeControls(row).find((node) => isNativeMoveControl(node));
-    if (directMove) {
-      clickNode(directMove);
-      return true;
-    }
-    const triggers = possibleNativeControls(row).filter(isMenuTrigger);
-    for (const trigger of triggers) {
-      clickNode(trigger);
-      for (const delay of [80, 180, 360, 700]) {
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        const menus = [...document.querySelectorAll("[role='menu'],[data-radix-menu-content],[cmdk-list],body")];
-        for (const menu of menus) {
-          const item = [...menu.querySelectorAll("button,[role='menuitem'],[role='option'],[cmdk-item],div")]
-            .filter(visible)
-            .find(isNativeMoveControl);
-          if (item) {
-            clickNode(item);
-            return true;
-          }
-        }
-      }
-    }
-    return false;
-  }
-
-  async function activateMove(row, event) {
-    stopButtonEvent(event);
-    hideTooltip();
-    const conversationUuid = rowId(row) || currentConversationUuid();
-    if (conversationUuid) {
-      try {
-        const orgUuid = discoverOrganizationUuid();
-        if (!orgUuid) throw new Error("missing organization uuid");
-        showToast("正在读取项目列表…");
-        const projectUuid = await showMoveDialog(row, await fetchProjects(orgUuid));
-        if (projectUuid !== undefined) {
-          await moveConversationToProject(conversationUuid, projectUuid);
-          showToast(projectUuid ? "已移动到项目" : "已移至普通对话");
-          scheduleScan();
-          return;
-        }
-        return;
-      } catch (error) {
-        globalThis.__CLAUDE_ZH_CN_SESSION_MOVE_STATE__ = {
-          title: rowTitle(row),
-          id: conversationUuid,
-          href: rowHref(row),
-          updatedAt: new Date().toISOString(),
-          lastError: String(error?.message || error)
-        };
-        showToast(`移动接口失败：${String(error?.message || error)}`);
-      }
-    }
-    showToast("正在打开 Claude 自带移动入口…");
-    if (await tryNativeMove(row)) return;
-    globalThis.__CLAUDE_ZH_CN_SESSION_MOVE_STATE__ = {
-      title: rowTitle(row),
-      id: rowId(row),
-      href: rowHref(row),
-      updatedAt: new Date().toISOString(),
-      lastError: "未找到 Claude 自带移动入口"
-    };
-    showToast("未找到 Claude 自带移动入口，已记录诊断信息");
-  }
-
-  function actionButton(className, label, icon, handler, row) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `${ACTION_BUTTON_CLASS} ${className}`;
-    button.dataset.sessionDeleteVersion = VERSION;
-    button.setAttribute("aria-label", label);
-    button.innerHTML = icon;
-    ["pointerdown", "mousedown", "mouseup", "touchstart"].forEach((eventName) => {
-      button.addEventListener(eventName, stopButtonEvent, true);
-    });
-    button.addEventListener("pointerenter", () => showTooltip(button, label));
-    button.addEventListener("pointerleave", hideTooltip);
-    button.addEventListener("focus", () => showTooltip(button, label));
-    button.addEventListener("blur", hideTooltip);
-    button.addEventListener("click", (event) => handler(row, event), true);
-    return button;
-  }
-
-  function directActionButtons(row) {
-    return Array.from(row?.children || []).filter((node) => node.classList?.contains(ACTION_BUTTON_CLASS) && !node.classList?.contains(PORTAL_BUTTON_CLASS));
-  }
-
-  function removeDirectActionButtons(row) {
-    directActionButtons(row).forEach((node) => node.remove());
-  }
-
-  function attachedAncestorActionRow(row) {
-    for (let current = row?.parentElement; current && current !== document.body; current = current.parentElement) {
-      if (current.getAttribute?.(ROW_FLAG) === "true" && directActionButtons(current).length) return current;
-      const rect = current.getBoundingClientRect?.();
-      if (rect && (rect.width > 620 || rect.height > 280)) return null;
-    }
-    return null;
-  }
-
-  function cleanupNestedActionRows(row) {
-    row.querySelectorAll?.(`[${ROW_FLAG}="true"]`).forEach((nested) => {
-      if (nested === row) return;
-      nested.removeAttribute(ROW_FLAG);
-      removeDirectActionButtons(nested);
-    });
-  }
-
-  function detachRow(row) {
-    if (!row) return;
-    row.removeAttribute(ROW_FLAG);
-    removeDirectActionButtons(row);
-    if (activeRow === row) cleanupPortalButton();
-  }
-
-  function cleanupProviderToolbarActions() {
-    if (providerCleanupRunning) return 0;
-    providerCleanupRunning = true;
-    let removed = 0;
-    try {
-      document.querySelectorAll(`.${ACTION_BUTTON_CLASS}`).forEach((button) => {
-        if (button.classList?.contains(PORTAL_BUTTON_CLASS)) return;
-        const parent = button.parentElement;
-        const owner = providerToolbarAncestor(parent || button);
-        const explicitSessionOwner = explicitSessionActionAncestor(button);
-        if (explicitSessionOwner || (!owner && sessionActionAncestor(button))) return;
-        if (!owner && !isViewportSidebarFooterNode(button)) return;
-        button.remove();
-        removed += 1;
-        const row = owner || parent;
-        if (row && !row.querySelector?.(`.${ACTION_BUTTON_CLASS}:not(.${PORTAL_BUTTON_CLASS})`)) {
-          row.removeAttribute?.(ROW_FLAG);
-        }
-        if (activeRow && (activeRow === row || row?.contains?.(activeRow))) cleanupPortalButton();
-      });
-      if (activeRow
-        && !sessionActionAncestor(activeRow)
-        && (providerToolbarAncestor(activeRow) || isViewportSidebarFooterNode(activeRow))) {
-        cleanupPortalButton();
-      }
-    } finally {
-      providerCleanupRunning = false;
-    }
-    return removed;
-  }
-
-  function attachRow(row) {
-    if (!looksLikeSidebarSessionRow(row)) return;
-    if (attachedAncestorActionRow(row)) {
-      removeDirectActionButtons(row);
-      row.removeAttribute(ROW_FLAG);
-      return;
-    }
-    cleanupNestedActionRows(row);
-    row.setAttribute(ROW_FLAG, "true");
-    const existing = directActionButtons(row)[0];
-    if (existing?.dataset.sessionDeleteVersion === VERSION) return;
-    removeDirectActionButtons(row);
-    row.appendChild(actionButton(MOVE_BUTTON_CLASS, "移动", moveIconSvg(), activateMove, row));
-    row.appendChild(actionButton(EXPORT_BUTTON_CLASS, "导出", exportIconSvg(), activateExport, row));
-    row.appendChild(actionButton(BUTTON_CLASS, "删除", trashIconSvg(), activateDelete, row));
-  }
-
-  function cleanupRejectedRows() {
-    document.querySelectorAll(`[${ROW_FLAG}="true"]`).forEach((row) => {
-      if (looksLikeSidebarSessionRow(row)) return;
-      detachRow(row);
-    });
-  }
-
-  function candidateRows() {
-    const rows = new Map();
-    recentSectionRoots().forEach(({ panel, marker }) => {
-      candidateNodesForSection(panel, marker).forEach((node) => {
-        const row = recentsRowContainer(node);
-        const normalized = normalizeRecentsRow(row);
-        if (!looksLikeSidebarSessionRow(normalized)) return;
-        const key = recentsRowKey(normalized);
-        if (!key) return;
-        rows.set(key, preferRecentsRow(rows.get(key), normalized));
-      });
-    });
-    return [...rows.values()];
-  }
-
-  function candidateRowSamples(rows) {
-    return rows.slice(0, 12).map((row) => {
-      const rect = row.getBoundingClientRect?.();
-      return {
-        tag: row.tagName,
-        title: rowTitle(row),
-        text: rowVisibleText(row).slice(0, 120),
-        id: rowId(row),
-        href: rowHref(row),
-        signal: hasSessionSignal(row),
-        rejectReason: sessionRowRejectReason(row),
-        rect: rect ? { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) } : null
-      };
-    });
-  }
-
-  function userQuestionNodes() {
-    const direct = [...mainRoot().querySelectorAll("[data-message-author-role='user'],[data-author='user'],[data-testid*='human'],[data-testid*='prompt'],[data-testid*='question'],[class*='human-message'],[class*='user-message'],[class*='prompt-message']")]
-      .filter(visible)
-      .filter((node) => messageRole(node) === "用户" || !messageRole(node));
-    if (direct.length) return direct;
-    return messageNodes().filter((node) => messageRole(node) === "用户");
-  }
-
-  function summarizeQuestion(text) {
-    return String(text || "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 64);
-  }
-
-  function timelineSummaryFor(node) {
-    const raw = String(node?.textContent || "");
-    const cached = timelineSummaryCache.get(node);
-    if (cached && cached.raw === raw) return cached.summary;
-    const summary = summarizeQuestion(rowVisibleText(node));
-    timelineSummaryCache.set(node, { raw, summary });
-    return summary;
-  }
-
-  function ensureTimeline() {
-    let timeline = document.getElementById(TIMELINE_ID);
-    if (timeline) return timeline;
-    timeline = document.createElement("div");
-    timeline.id = TIMELINE_ID;
-    timeline.setAttribute("aria-label", "对话时间线");
-    document.body.appendChild(timeline);
-    return timeline;
-  }
-
-  function renderTimeline() {
-    lastTimelineRunAt = performance?.now?.() || Date.now();
-    const timeline = ensureTimeline();
-    const questions = userQuestionNodes().slice(0, 80);
-    const items = [];
-    questions.forEach((node, index) => {
-      if (!node.id) node.id = `claude-zh-cn-user-question-${index + 1}`;
-      const summary = timelineSummaryFor(node);
-      if (!summary) return;
-      items.push({ node, index, summary });
-    });
-    const signature = items.map((item) => `${item.node.id}:${item.summary}`).join("|");
-    if (signature && signature === lastTimelineSignature && timeline.children.length === items.length) {
-      globalThis.__CLAUDE_ZH_CN_CONVERSATION_TIMELINE_STATE__ = {
-        version: VERSION,
-        count: timeline.children.length,
-        updatedAt: new Date().toISOString(),
-        skipped: true
-      };
-      return;
-    }
-    lastTimelineSignature = signature;
-    const buttons = [];
-    items.forEach(({ node, summary }) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      const summaryNode = document.createElement("span");
-      summaryNode.className = "claude-zh-cn-timeline-summary";
-      summaryNode.textContent = summary;
-      button.appendChild(summaryNode);
-      button.title = summary;
-      button.addEventListener("click", (event) => {
-        stopButtonEvent(event);
-        node.scrollIntoView({ block: "center", behavior: "smooth" });
-      }, true);
-      buttons.push(button);
-    });
-    if (timeline.replaceChildren) timeline.replaceChildren(...buttons);
-    else {
-      timeline.querySelectorAll("button").forEach((node) => node.remove());
-      buttons.forEach((button) => timeline.appendChild(button));
-    }
-    globalThis.__CLAUDE_ZH_CN_CONVERSATION_TIMELINE_STATE__ = {
-      version: VERSION,
-      count: timeline.children.length,
-      questionCount: questions.length,
-      messageCount: messageNodes().length,
-      updatedAt: new Date().toISOString()
-    };
-  }
-
-  let timelineTimer = 0;
-  let timelineTimerDueAt = 0;
-  let lastTimelineRunAt = 0;
-  let lastMainMutationAt = 0;
-  function hasQuickConversationContent() {
-    return !!mainRoot().querySelector?.("[data-message-author-role='user'],[data-author='user'],[data-testid*='message'],[data-testid*='human'],[data-testid*='prompt'],[data-testid*='question'],[class*='font-claude-message'],[class*='claude-message'],[class*='human-message'],[class*='user-message'],article");
-  }
-
-  function hasConversationContent() {
-    return userQuestionNodes().length > 0;
-  }
-
-  function isConversationPage() {
-    return !!currentConversationUuid()
-      || /\/(?:chat|conversation|thread|session)\//i.test(location.pathname || location.href || "")
-      || hasQuickConversationContent();
-  }
-
-  function runTimelineRenderWhenIdle() {
-    timelineTimer = 0;
-    timelineTimerDueAt = 0;
-    if (!isConversationPage()) {
-      document.getElementById(TIMELINE_ID)?.remove();
-      globalThis.__CLAUDE_ZH_CN_CONVERSATION_TIMELINE_STATE__ = {
-        version: VERSION,
-        count: 0,
-        questionCount: 0,
-        messageCount: 0,
-        updatedAt: new Date().toISOString()
-      };
-      return;
-    }
-    const now = performance?.now?.() || Date.now();
-    if (lastMainMutationAt && now - lastMainMutationAt < 900) {
-      scheduleTimelineRender(900 - (now - lastMainMutationAt));
-      return;
-    }
-    const idle = window.requestIdleCallback || ((callback) => setTimeout(callback, 80));
-    idle(renderTimeline, { timeout: 900 });
-  }
-
-  function scheduleTimelineRender(delay = TIMELINE_DELAY_MS) {
-    if (!isConversationPage()) {
-      runTimelineRenderWhenIdle();
-      return;
-    }
-    const now = performance?.now?.() || Date.now();
-    const timeline = document.getElementById(TIMELINE_ID);
-    const hasVisibleTimeline = !!(timeline && timeline.children.length);
-    if (lastTimelineRunAt && hasVisibleTimeline) delay = Math.max(delay, TIMELINE_MIN_INTERVAL_MS - (now - lastTimelineRunAt));
-    const dueAt = now + delay;
-    if (timelineTimer) {
-      if (!hasVisibleTimeline && dueAt < timelineTimerDueAt - 50) {
-        clearTimeout(timelineTimer);
-        timelineTimer = 0;
-      } else {
-        return;
-      }
-    }
-    timelineTimerDueAt = dueAt;
-    timelineTimer = setTimeout(runTimelineRenderWhenIdle, delay);
-  }
-
-  function currentScrollKey() {
-    return `${SCROLL_STORAGE_PREFIX}${location.pathname}${location.search}`;
-  }
-
-  function scrollContainer() {
-    const candidates = [
-      document.querySelector("main"),
-      document.querySelector("[role='main']"),
-      document.scrollingElement,
-      document.documentElement
-    ].filter(Boolean);
-    return candidates.find((node) => node.scrollHeight > node.clientHeight + 20) || document.scrollingElement || document.documentElement;
-  }
-
-  function rememberScrollPosition() {
-    try {
-      const container = scrollContainer();
-      sessionStorage.setItem(currentScrollKey(), String(container.scrollTop || window.scrollY || 0));
-    } catch {
-      return;
-    }
-  }
-
-  let scrollSaveTimer = 0;
-  function scheduleRememberScrollPosition() {
-    if (scrollSaveTimer) return;
-    scrollSaveTimer = setTimeout(() => {
-      scrollSaveTimer = 0;
-      rememberScrollPosition();
-    }, 450);
-  }
-
-  function restoreScrollPosition() {
-    try {
-      const stored = sessionStorage.getItem(currentScrollKey());
-      if (stored == null) return;
-      const value = Number(stored);
-      if (!Number.isFinite(value)) return;
-      const container = scrollContainer();
-      setTimeout(() => {
-        container.scrollTop = value;
-        if (container === document.scrollingElement || container === document.documentElement) window.scrollTo(window.scrollX, value);
-      }, 160);
-    } catch {
-      return;
-    }
-  }
-
-  function centeredLayoutWidth() {
-    const raw = localStorage.getItem(CENTERED_WIDTH_KEY) || "980";
-    const value = Number(String(raw).replace(/[^\d.]/g, ""));
-    if (!Number.isFinite(value)) return 980;
-    return Math.max(640, Math.min(1600, Math.round(value)));
-  }
-
-  function isThirdPartyProviderSettingsPage() {
-    const root = document.querySelector("main,[role='main']") || document.body;
-    const now = performance?.now?.() || Date.now();
-    const key = `${location.pathname}:${root?.textContent?.length || 0}`;
-    if (providerSettingsCache.key === key && now - providerSettingsCache.at < 1200) return providerSettingsCache.value;
-    const text = (root?.textContent || "").slice(0, 12000);
-    const hasProviderTitle = /(管理第三方供应商|第三方供应商|Manage third-party|Inference provider)/i.test(text);
-    const hasProviderFields = /(第三方认证方案|自定义推理标头|Authorization|x-api-key|模型发现|测试模型发现|Gateway base URL|Gateway API key)/i.test(text);
-    providerSettingsCache = { key, at: now, value: hasProviderTitle && hasProviderFields };
-    return providerSettingsCache.value;
-  }
-
-  function shouldShowCenteredLayoutControls() {
-    return !isThirdPartyProviderSettingsPage();
-  }
-
-  function applyCenteredLayout(enabled) {
-    document.documentElement.style.setProperty("--claude-zh-cn-centered-width", `${centeredLayoutWidth()}px`);
-    document.documentElement.classList.toggle(CENTERED_CLASS, !!enabled);
-    const button = document.getElementById(CENTERED_TOGGLE_ID);
-    if (button) {
-      const showControl = shouldShowCenteredLayoutControls();
-      button.style.display = showControl ? "" : "none";
-      if (!showControl) document.querySelectorAll(".claude-zh-cn-centered-width-dialog").forEach((node) => node.remove());
-      button.textContent = enabled ? `居中 ${centeredLayoutWidth()}` : "居中关";
-      button.title = "点击开关，右键或双击设置宽度";
-      button.setAttribute("aria-pressed", enabled ? "true" : "false");
-    }
-  }
-
-  function centeredLayoutEnabled() {
-    return localStorage.getItem("claude-zh-cn-centered-layout") === "1";
-  }
-
-  function toggleCenteredLayout(event) {
-    event?.preventDefault();
-    event?.stopPropagation();
-    const next = !centeredLayoutEnabled();
-    localStorage.setItem("claude-zh-cn-centered-layout", next ? "1" : "0");
-    applyCenteredLayout(next);
-  }
-
-  function showCenteredWidthDialog(event) {
-    event?.preventDefault();
-    event?.stopPropagation();
-    document.querySelectorAll(".claude-zh-cn-centered-width-dialog").forEach((node) => node.remove());
-    document.getElementById(CENTERED_TOGGLE_ID)?.removeAttribute("data-centered-dialog-open");
-    const toggleButton = document.getElementById(CENTERED_TOGGLE_ID);
-    toggleButton?.setAttribute("data-centered-dialog-open", "true");
-    const dialog = document.createElement("div");
-    dialog.className = "claude-zh-cn-centered-width-dialog";
-    dialog.innerHTML = `
-      <label>自定义居中宽度</label>
-      <input type="number" min="640" max="1600" step="20" value="${centeredLayoutWidth()}" aria-label="居中宽度">
-      <div class="claude-zh-cn-centered-width-dialog-actions">
-        <button type="button" data-centered-cancel>取消</button>
-        <button type="button" data-centered-save>保存</button>
-      </div>
-    `;
-    const close = () => {
-      dialog.remove();
-      toggleButton?.removeAttribute("data-centered-dialog-open");
-    };
-    const save = () => {
-      const input = dialog.querySelector("input");
-      const next = Number(String(input?.value || "").replace(/[^\d.]/g, ""));
-      if (Number.isFinite(next)) localStorage.setItem(CENTERED_WIDTH_KEY, String(Math.max(640, Math.min(1600, Math.round(next)))));
-      localStorage.setItem("claude-zh-cn-centered-layout", "1");
-      applyCenteredLayout(true);
-      close();
-    };
-    dialog.addEventListener("click", (clickEvent) => {
-      clickEvent.stopPropagation();
-      if (clickEvent.target.closest("[data-centered-save]")) save();
-      if (clickEvent.target.closest("[data-centered-cancel]")) close();
-    }, true);
-    dialog.addEventListener("keydown", (keyEvent) => {
-      if (keyEvent.key === "Enter") save();
-      if (keyEvent.key === "Escape") close();
-    }, true);
-    document.body.appendChild(dialog);
-    dialog.querySelector("input")?.focus();
-  }
-
-  function ensureCenteredLayoutToggle() {
-    if (document.getElementById(CENTERED_TOGGLE_ID)) return;
-    const button = document.createElement("button");
-    button.id = CENTERED_TOGGLE_ID;
-    button.type = "button";
-    button.addEventListener("click", toggleCenteredLayout, true);
-    button.addEventListener("contextmenu", showCenteredWidthDialog, true);
-    button.addEventListener("dblclick", showCenteredWidthDialog, true);
-    document.body.appendChild(button);
-    applyCenteredLayout(centeredLayoutEnabled());
-  }
-
-  function scanRows() {
-    const startedAt = performance?.now?.() || Date.now();
-    lastScanRunAt = startedAt;
-    try {
-      invalidateScanCache();
-      resetVisibleTextCache();
-      installStyle();
-      cleanupPortalButton();
-      ensureCenteredLayoutToggle();
-      cleanupProviderToolbarActions();
-      cleanupRejectedRows();
-      const rows = candidateRows();
-      rows.forEach(attachRow);
-      globalThis.__CLAUDE_ZH_CN_SESSION_DELETE_SCAN_STATE__ = {
-        version: VERSION,
-        panelCount: sessionPanelRoots().length,
-        sectionCount: recentSectionRoots().length,
-        candidateCount: rows.length,
-        attachedCount: document.querySelectorAll(`.${ACTION_BUTTON_CLASS}:not(.${PORTAL_BUTTON_CLASS})`).length,
-        candidates: globalThis.__CLAUDE_ZH_CN_SESSION_DELETE_DEBUG__ ? candidateRowSamples(rows) : [],
-        portalButton: !!portalButton,
-        portalVisible: portalButton?.dataset.visible === "true",
-        localDeleteBridge: localDeleteBridgeReady(),
-        activeTitle: activeRow ? rowTitle(activeRow) : "",
-        exportButtonCount: document.querySelectorAll(`.${EXPORT_BUTTON_CLASS}`).length,
-        moveButtonCount: document.querySelectorAll(`.${MOVE_BUTTON_CLASS}`).length,
-        timelineCount: document.getElementById(TIMELINE_ID)?.children.length || 0,
-        centeredLayout: centeredLayoutEnabled(),
-        mutationRecords: lastMutationSummary.records,
-        mutationInspectedRecords: lastMutationSummary.inspectedRecords,
-        mutationInspectedNodes: lastMutationSummary.inspectedNodes,
-        mutationSkippedInjected: lastMutationSummary.skippedInjected,
-        mutationCapped: lastMutationSummary.capped,
-        scanDurationMs: Math.round(((performance?.now?.() || Date.now()) - startedAt) * 10) / 10,
-        lastError: "",
-        updatedAt: new Date().toISOString()
-      };
-    } catch (error) {
-      const lastError = String(error?.message || error);
-      globalThis.__CLAUDE_ZH_CN_SESSION_DELETE_SCAN_STATE__ = {
-        version: VERSION,
-        panelCount: 0,
-        sectionCount: 0,
-        candidateCount: 0,
-        attachedCount: document.querySelectorAll(`.${ACTION_BUTTON_CLASS}:not(.${PORTAL_BUTTON_CLASS})`).length,
-        candidates: [],
-        portalButton: !!portalButton,
-        portalVisible: portalButton?.dataset.visible === "true",
-        localDeleteBridge: localDeleteBridgeReady(),
-        activeTitle: activeRow ? rowTitle(activeRow) : "",
-        exportButtonCount: document.querySelectorAll(`.${EXPORT_BUTTON_CLASS}`).length,
-        moveButtonCount: document.querySelectorAll(`.${MOVE_BUTTON_CLASS}`).length,
-        timelineCount: document.getElementById(TIMELINE_ID)?.children.length || 0,
-        centeredLayout: centeredLayoutEnabled(),
-        mutationRecords: lastMutationSummary.records,
-        mutationInspectedRecords: lastMutationSummary.inspectedRecords,
-        mutationInspectedNodes: lastMutationSummary.inspectedNodes,
-        mutationSkippedInjected: lastMutationSummary.skippedInjected,
-        mutationCapped: lastMutationSummary.capped,
-        lastError,
-        updatedAt: new Date().toISOString()
-      };
-    }
-  }
-
-  let scanTimer = 0;
-  let lastScanRunAt = 0;
-  function runScanWhenIdle() {
-    scanTimer = 0;
-    const idle = window.requestIdleCallback || ((callback) => setTimeout(callback, 80));
-    idle(scanRows, { timeout: 900 });
-  }
-
-  function scheduleScan(delay = SCAN_DELAY_MS) {
-    if (scanTimer) return;
-    const now = performance?.now?.() || Date.now();
-    if (lastScanRunAt) delay = Math.max(delay, SCAN_MIN_INTERVAL_MS - (now - lastScanRunAt));
-    scanTimer = setTimeout(runScanWhenIdle, delay);
-  }
-
-  function isInjectedRuntimeNode(node) {
-    if (!node || node.nodeType !== 1) return false;
-    if (node.id === TIMELINE_ID || node.id === CENTERED_TOGGLE_ID) return true;
-    if (node.classList?.contains(ACTION_BUTTON_CLASS)) return true;
-    if (node.classList?.contains(TOOLTIP_CLASS) || node.classList?.contains(TOAST_CLASS)) return true;
-    if (node.classList?.contains("claude-zh-cn-session-delete-confirm-overlay")) return true;
-    if (node.classList?.contains("claude-zh-cn-centered-width-dialog")) return true;
-    return !!node.closest?.(`#${TIMELINE_ID},#${CENTERED_TOGGLE_ID},.${ACTION_BUTTON_CLASS},.${TOOLTIP_CLASS},.${TOAST_CLASS},.claude-zh-cn-session-delete-confirm-overlay,.claude-zh-cn-centered-width-dialog`);
-  }
-
-  function nodeContainsInjectedAction(node) {
-    if (!node || node.nodeType !== 1) return false;
-    if (node.classList?.contains(ACTION_BUTTON_CLASS)) return true;
-    return !!node.querySelector?.(`.${ACTION_BUTTON_CLASS}`);
-  }
-
-  function nodeTouchesSidebar(node) {
-    if (!node || node.nodeType !== 1) return false;
-    if (node.closest?.(SIDEBAR_CONTAINER_SELECTORS) || node.matches?.(SIDEBAR_CONTAINER_SELECTORS)) return true;
-    if (node.closest?.(MAIN_CONTAINER_SELECTORS) || node.matches?.(MAIN_CONTAINER_SELECTORS)) return false;
-    return scopedSelectorMatch(node, SIDEBAR_CONTAINER_SELECTORS)
-      || scopedSelectorMatch(node, SESSION_SIGNAL_SELECTORS);
-  }
-
-  function nodeTouchesMain(node) {
-    if (!node || node.nodeType !== 1) return false;
-    if (node.closest?.(MAIN_CONTAINER_SELECTORS) || node.matches?.(MAIN_CONTAINER_SELECTORS)) return true;
-    if (node.closest?.(SIDEBAR_CONTAINER_SELECTORS) || node.matches?.(SIDEBAR_CONTAINER_SELECTORS)) return false;
-    return scopedSelectorMatch(node, MAIN_CONTAINER_SELECTORS);
-  }
-
-  function isLargeMutationScope(node) {
-    if (!node || node.nodeType !== 1) return false;
-    if (node === document.body || node === document.documentElement) return true;
-    const childCount = node.childElementCount || 0;
-    if (childCount > 120) return true;
-    const rect = node.getBoundingClientRect?.();
-    const widthLimit = Math.max(720, (window.innerWidth || 1200) * 0.75);
-    const heightLimit = Math.max(520, (window.innerHeight || 800) * 0.75);
-    return !!rect && rect.width > widthLimit && rect.height > heightLimit;
-  }
-
-  function scopedSelectorMatch(node, selector) {
-    if (!node || node.nodeType !== 1) return false;
-    if (node.matches?.(selector)) return true;
-    if (isLargeMutationScope(node)) {
-      const children = Array.from(node.children || []).slice(0, 24);
-      return children.some((child) => child.matches?.(selector));
-    }
-    return !!node.querySelector?.(selector);
-  }
-
-  function mutationElementNodes(mutation, remaining) {
-    const nodes = [];
-    const push = (node) => {
-      if (nodes.length >= remaining) return;
-      if (!node || node.nodeType !== 1 || nodes.includes(node)) return;
-      nodes.push(node);
-    };
-    if (mutation.type === "attributes") {
-      push(mutation.target);
-    } else if (mutation.type === "characterData") {
-      push(mutation.target?.parentElement);
-    } else {
-      for (const node of mutation.addedNodes || []) push(node);
-      for (const node of mutation.removedNodes || []) push(node);
-    }
-    return nodes;
-  }
-
-  function handlePageMutations(mutations) {
-    const list = Array.from(mutations || []);
-    if (!list.length) {
-      scheduleScan();
-      scheduleTimelineRender();
-      return;
-    }
-    if (list.some((mutation) => mutation.type === "characterData")) resetVisibleTextCache();
-    let sidebarChanged = false;
-    let mainChanged = false;
-    let inspectedRecords = 0;
-    let inspectedNodes = 0;
-    let skippedInjected = 0;
-    let actionButtonsChanged = false;
-    let capped = list.length > MUTATION_RECORD_LIMIT;
-    for (const mutation of list.slice(0, MUTATION_RECORD_LIMIT)) {
-      inspectedRecords += 1;
-      const remaining = MUTATION_NODE_LIMIT - inspectedNodes;
-      if (remaining <= 0) {
-        capped = true;
-        break;
-      }
-      const nodes = mutationElementNodes(mutation, remaining);
-      inspectedNodes += nodes.length;
-      if (!actionButtonsChanged && nodes.some(nodeContainsInjectedAction)) actionButtonsChanged = true;
-      if (nodes.length && nodes.every(isInjectedRuntimeNode)) {
-        skippedInjected += 1;
-        continue;
-      }
-      if (!sidebarChanged && nodes.some(nodeTouchesSidebar)) sidebarChanged = true;
-      if (!mainChanged && nodes.some(nodeTouchesMain)) mainChanged = true;
-      if (sidebarChanged && mainChanged) break;
-    }
-    lastMutationSummary = {
-      records: list.length,
-      inspectedRecords,
-      inspectedNodes,
-      skippedInjected,
-      capped
-    };
-    if (actionButtonsChanged) cleanupProviderToolbarActions();
-    if (sidebarChanged) scheduleScan();
-    if (mainChanged) {
-      lastMainMutationAt = performance?.now?.() || Date.now();
-      scheduleTimelineRender(900);
-    }
-  }
-
-  let pointerAttachTimer = 0;
-  let pointerAttachTarget = null;
-  let lastPointerAttachRow = null;
-  function attachPointerTarget() {
-    pointerAttachTimer = 0;
-    const target = pointerAttachTarget;
-    pointerAttachTarget = null;
-    if (!target || target.nodeType !== 1 || isInjectedRuntimeNode(target) || !nodeTouchesSidebar(target)) return;
-    const row = normalizeRecentsRow(recentsRowContainer(target));
-    if (row === lastPointerAttachRow
-      && row.getAttribute?.(ROW_FLAG) === "true"
-      && directActionButtons(row).length
-      && looksLikeSidebarSessionRow(row)) return;
-    lastPointerAttachRow = row;
-    if (!looksLikeSidebarSessionRow(row)) {
-      cleanupProviderToolbarActions();
-      detachRow(row);
-      return;
-    }
-    if (looksLikeModeOrToolbarChrome(row, rowVisibleText(row))) return;
-    attachRow(row);
-  }
-
-  function handleSidebarPointer(event) {
-    const target = event.target;
-    if (!target || target.nodeType !== 1 || isInjectedRuntimeNode(target)) return;
-    pointerAttachTarget = target;
-    if (pointerAttachTimer) return;
-    pointerAttachTimer = setTimeout(attachPointerTarget, POINTER_ATTACH_DELAY_MS);
-  }
-
-  function start() {
-    installStyle();
-    cleanupProviderToolbarActions();
-    cleanupRejectedRows();
-    ensureCenteredLayoutToggle();
-    scheduleScan(STARTUP_SCAN_DELAY_MS);
-    scheduleTimelineRender(STARTUP_TIMELINE_DELAY_MS);
-    restoreScrollPosition();
-    document.body?.removeEventListener?.("pointerover", handleSidebarPointer, true);
-    document.body?.addEventListener?.("pointerover", handleSidebarPointer, true);
-    window.removeEventListener("scroll", scheduleRememberScrollPosition, true);
-    window.addEventListener("scroll", scheduleRememberScrollPosition, true);
-    window.removeEventListener("beforeunload", rememberScrollPosition, true);
-    window.addEventListener("beforeunload", rememberScrollPosition, true);
-    window.__CLAUDE_ZH_CN_SESSION_DELETE_OBSERVER__?.disconnect?.();
-    window.__CLAUDE_ZH_CN_SESSION_DELETE_OBSERVER__ = new MutationObserver(handlePageMutations);
-    window.__CLAUDE_ZH_CN_SESSION_DELETE_OBSERVER__.observe(document.body || document.documentElement, {
-      childList: true,
-      subtree: true,
-      characterData: true
-    });
-    window.__CLAUDE_ZH_CN_SESSION_DELETE_INTERVAL__ && clearInterval(window.__CLAUDE_ZH_CN_SESSION_DELETE_INTERVAL__);
-    window.__CLAUDE_ZH_CN_SESSION_DELETE_INTERVAL__ = setInterval(() => {
-      rememberScrollPosition();
-    }, 4000);
-  }
-
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start, { once: true });
-  else start();
-  if (globalThis.__CLAUDE_ZH_CN_SESSION_DELETE_DEBUG__) {
-    globalThis.__CLAUDE_ZH_CN_SESSION_DELETE_DEBUG_API__ = {
-      sessionPanelRoots,
-      recentSectionRoots,
-      sessionRowRejectReason,
-      candidateRows,
-      looksLikeSidebarSessionRow,
-      normalizeRecentsRow,
-      recentsRowContainer,
-      hasSessionSignal,
-      isCurrentSidebarItem,
-      isInsideRecentsSection,
-      localSessionId,
-      localDeleteBridgeReady,
-      messageNodes,
-      messageRole,
-      buildConversationMarkdown
-    };
-  }
-  } catch (error) {
-    try {
-      globalThis.__CLAUDE_ZH_CN_SESSION_DELETE_PATCH__ = false;
-      globalThis.__CLAUDE_ZH_CN_SESSION_DELETE_PATCH_VERSION__ = VERSION;
-      globalThis.__CLAUDE_ZH_CN_SESSION_DELETE_SCAN_STATE__ = {
-        version: VERSION,
-        enabled: false,
-        candidateCount: 0,
-        attachedCount: 0,
-        timelineCount: 0,
-        lastError: String(error?.message || error),
-        updatedAt: new Date().toISOString()
-      };
-      console.warn?.("[claude-zh-cn] session controls disabled:", error);
-    } catch {}
-  }
-})();
-'''.strip()
-    return "\n".join([
-        "// __CLAUDE_ZH_CN_SESSION_DELETE_PATCH_BEGIN__",
-        body,
-        "// __CLAUDE_ZH_CN_SESSION_DELETE_PATCH_END__",
-    ])
+# 补丁指纹标记：官方 bundle 绝不包含，是“已打补丁”的可靠指纹。
+# 早期版本注入的功能运行时（字体管理、会话快捷操作、对话导出、移动到项目、
+# 阅读布局）已整体移除，现在只向入口 bundle 追加这一个纯注释指纹。
+PATCH_MARKER_BEGIN = "// __CLAUDE_ZH_CN_PATCH_BEGIN__"
+PATCH_MARKER_END = "// __CLAUDE_ZH_CN_PATCH_END__"
+PATCH_MARKER_SCRIPT = (
+    f"{PATCH_MARKER_BEGIN}\n"
+    "// Claude zh-CN patch fingerprint. The official bundle never contains it.\n"
+    f"{PATCH_MARKER_END}\n"
+)
+# 旧版功能运行时的注入块标记：重打补丁时用于把它们从入口 bundle 中剥离干净。
+LEGACY_BLOCK_MARKERS = (
+    ("// __CLAUDE_ZH_CN_FONT_PATCH_BEGIN__", "// __CLAUDE_ZH_CN_FONT_PATCH_END__"),
+    ("// __CLAUDE_ZH_CN_SESSION_DELETE_PATCH_BEGIN__", "// __CLAUDE_ZH_CN_SESSION_DELETE_PATCH_END__"),
+)
+LEGACY_RUNTIME_FLAGS = (
+    "__CLAUDE_ZH_CN_FONT_PATCH__",
+    "__CLAUDE_ZH_CN_SESSION_DELETE_PATCH__",
+)
+INJECTED_BLOCK_MARKERS = ((PATCH_MARKER_BEGIN, PATCH_MARKER_END),) + LEGACY_BLOCK_MARKERS
 
 
 def find_appx_claude_package() -> Path | None:
@@ -3371,8 +149,8 @@ def iter_assets_dirs(app_resources: Path) -> list[Path]:
 
 
 def chunk_state_path() -> Path:
-    """Return the cache path while respecting tests that replace BACKUP_ROOT."""
-    return BACKUP_ROOT / CHUNK_STATE_NAME
+    """Return the tool cache path; it is never part of a restore backup."""
+    return STATE_ROOT / CHUNK_STATE_NAME
 
 
 def normalize_app_dir(app_dir: Path) -> str:
@@ -3383,8 +161,7 @@ def patch_signature() -> str:
     """Hash every input that can change the resulting JS patch."""
     payload = {
         "patches": PATCHES,
-        "font_runtime": font_inject_script(),
-        "session_runtime": session_delete_inject_script(),
+        "marker_script": PATCH_MARKER_SCRIPT,
         "markers": INJECTED_BLOCK_MARKERS,
     }
     encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
@@ -3444,7 +221,12 @@ def save_chunk_state(state: dict) -> bool:
 
 
 def has_complete_runtime_markers(app_resources: Path) -> bool:
-    """Detect installations already patched by an older cache-less release."""
+    """Detect installations already carrying this tool's runtime fingerprint.
+
+    Accepts either the current fingerprint marker or the pair of legacy
+    feature-runtime markers, so installs patched by older releases are still
+    recognized (and upgraded instead of re-scanned from scratch).
+    """
     index_files = [
         path
         for assets_dir in iter_assets_dirs(app_resources)
@@ -3452,14 +234,17 @@ def has_complete_runtime_markers(app_resources: Path) -> bool:
     ]
     if not index_files:
         return False
-    required = tuple(marker for pair in INJECTED_BLOCK_MARKERS for marker in pair)
+    legacy_required = tuple(begin for begin, _ in LEGACY_BLOCK_MARKERS)
     for path in index_files:
         try:
             content = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             return False
-        if not all(marker in content for marker in required):
-            return False
+        if PATCH_MARKER_BEGIN in content:
+            continue
+        if all(begin in content for begin in legacy_required):
+            continue
+        return False
     return True
 
 
@@ -3493,20 +278,29 @@ def content_outside_injected_blocks(content: str) -> str:
     return "".join(pieces)
 
 
-def backup_file(path: Path, assets_dir: Path) -> None:
+def backup_file(path: Path, assets_dir: Path) -> bool:
+    """Back up relative to app/resources so assets/v1 and v2 never collide."""
     if not path.exists():
-        return
-    rel = path.relative_to(assets_dir)
+        return True
+    try:
+        app_resources = assets_dir.parents[2]
+        rel = path.relative_to(app_resources)
+    except (IndexError, ValueError):
+        return False
     dst = BACKUP_ROOT / rel
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if not dst.exists():
-        copy2_best_effort(path, dst, context="backup file")
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    if dst.exists():
+        return True
+    return copy2_best_effort(path, dst, context="backup file")
 
 
 def copy2_best_effort(src: Path, dst: Path, *, context: str) -> bool:
     """Copy a file and retry once after clearing the destination readonly bit."""
     try:
-        shutil.copy2(src, dst)
+        atomic_copy(src, dst)
         return True
     except PermissionError:
         if dst.exists():
@@ -3515,7 +309,7 @@ def copy2_best_effort(src: Path, dst: Path, *, context: str) -> bool:
             except OSError:
                 pass
         try:
-            shutil.copy2(src, dst)
+            atomic_copy(src, dst)
             return True
         except OSError as e:
             print(f"Warning: cannot copy {context} from {src} to {dst}: {e}; skipping")
@@ -3526,35 +320,10 @@ def copy2_best_effort(src: Path, dst: Path, *, context: str) -> bool:
         return False
 
 
-def set_font_config_mirror() -> bool:
-    """Mirror default font config into Claude config without changing app behavior."""
-    if not CONFIG_PATH.exists():
-        return False
-
-    try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return False
-
-    data.setdefault(
-        FONT_KEY,
-        {
-            "mode": "preset",
-            "presetId": "windows-modern",
-            "family": FONT_PRESETS[0]["family"],
-        },
-    )
-    return write_text_best_effort(
-        CONFIG_PATH,
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        context="font config mirror",
-    )
-
-
 def write_text_best_effort(path: Path, text: str, *, context: str) -> bool:
     """Write text and degrade gracefully on Windows permission issues."""
     try:
-        path.write_text(text, encoding="utf-8")
+        atomic_write_text(path, text)
         return True
     except PermissionError:
         try:
@@ -3562,7 +331,7 @@ def write_text_best_effort(path: Path, text: str, *, context: str) -> bool:
         except OSError:
             pass
         try:
-            path.write_text(text, encoding="utf-8")
+            atomic_write_text(path, text)
             return True
         except OSError as e:
             print(f"Warning: cannot write {context} at {path}: {e}; skipping")
@@ -3573,92 +342,61 @@ def write_text_best_effort(path: Path, text: str, *, context: str) -> bool:
         return False
 
 
-def patch_font_runtime(assets_dir: Path) -> int:
-    """Inject runtime font customizer into the entry bundle."""
-    candidates = sorted(assets_dir.glob("index-*.js"))
-    if not candidates:
-        print("Warning: no index-*.js found; skipping font runtime patch")
-        return 0
+def _strip_legacy_runtime_blocks(content: str, path: Path) -> tuple[str, int]:
+    """Remove feature runtimes injected by older releases from an entry bundle.
 
-    script = font_inject_script()
-    marker = "__CLAUDE_ZH_CN_FONT_PATCH__"
-    begin_marker = "// __CLAUDE_ZH_CN_FONT_PATCH_BEGIN__"
-    end_marker = "// __CLAUDE_ZH_CN_FONT_PATCH_END__"
-    changed = 0
-    for path in candidates:
-        backup_file(path, assets_dir)
-        content = path.read_text(encoding="utf-8")
-        if begin_marker in content and end_marker in content:
-            start = content.index(begin_marker)
-            end = content.index(end_marker, start) + len(end_marker)
-            new_content = content[:start].rstrip() + "\n" + script + "\n" + content[end:].lstrip()
-            action = "updated font runtime"
-        elif marker in content:
-            marker_pos = content.index(marker)
+    Covers both the ``BEGIN``/``END`` comment blocks and the oldest
+    ``;(()=>{ ... })();`` marker form.  An unterminated block aborts the patch
+    instead of truncating the bundle, matching the previous safety behavior.
+    """
+    removed = 0
+    for begin, end in LEGACY_BLOCK_MARKERS:
+        while begin in content:
+            start = content.index(begin)
+            end_pos = content.find(end, start)
+            if end_pos < 0:
+                raise RuntimeError(
+                    f"Incomplete legacy runtime marker in {path}; refusing to truncate the bundle"
+                )
+            content = content[:start].rstrip() + "\n" + content[end_pos + len(end):].lstrip()
+            removed += 1
+    for flag in LEGACY_RUNTIME_FLAGS:
+        while flag in content:
+            marker_pos = content.index(flag)
             start = content.rfind(";(()=>{", 0, marker_pos)
             if start == -1:
                 start = marker_pos
             legacy_end = content.find("})();", marker_pos)
-            end = legacy_end + len("})();") if legacy_end != -1 else len(content)
-            new_content = content[:start].rstrip() + "\n" + script + "\n" + content[end:].lstrip()
-            action = "replaced legacy font runtime"
-        else:
-            new_content = content.rstrip() + "\n" + script + "\n"
-            action = "injected font runtime"
-
-        if new_content == content:
-            continue
-        if write_text_best_effort(path, new_content, context="font runtime patch"):
-            changed += 1
-            print(f"  {path.name}: {action}")
-    return changed
+            if legacy_end == -1:
+                raise RuntimeError(
+                    f"Incomplete legacy runtime marker in {path}; refusing to truncate the bundle"
+                )
+            content = content[:start].rstrip() + "\n" + content[legacy_end + len("})();"):].lstrip()
+            removed += 1
+    return content, removed
 
 
-def patch_session_delete_runtime(assets_dir: Path) -> int:
-    """Inject hover delete action into the entry bundle."""
+def patch_entry_runtime(assets_dir: Path, *, backup: bool = True) -> int:
+    """Strip legacy feature runtimes and stamp the patch fingerprint marker."""
     candidates = sorted(assets_dir.glob("index-*.js"))
     if not candidates:
-        print("Warning: no index-*.js found; skipping session delete runtime patch")
+        print("Warning: no index-*.js found; skipping entry runtime patch")
         return 0
 
-    script = session_delete_inject_script()
-    marker = "__CLAUDE_ZH_CN_SESSION_DELETE_PATCH__"
-    begin_marker = "// __CLAUDE_ZH_CN_SESSION_DELETE_PATCH_BEGIN__"
-    end_marker = "// __CLAUDE_ZH_CN_SESSION_DELETE_PATCH_END__"
     changed = 0
     for path in candidates:
-        backup_file(path, assets_dir)
+        if backup and not backup_file(path, assets_dir):
+            raise OSError(f"Failed to back up entry runtime target: {path}")
         content = path.read_text(encoding="utf-8")
-        if begin_marker in content and end_marker in content:
-            start = content.index(begin_marker)
-            end = content.index(end_marker, start) + len(end_marker)
-            new_content = content[:start].rstrip() + "\n" + script + "\n" + content[end:].lstrip()
-            action = "updated session delete runtime"
-        elif marker in content:
-            marker_pos = content.index(marker)
-            start = content.rfind(";(()=>{", 0, marker_pos)
-            if start == -1:
-                start = marker_pos
-            legacy_end = content.find("})();", marker_pos)
-            end = legacy_end + len("})();") if legacy_end != -1 else len(content)
-            new_content = content[:start].rstrip() + "\n" + script + "\n" + content[end:].lstrip()
-            action = "replaced legacy session delete runtime"
-        else:
-            new_content = content.rstrip() + "\n" + script + "\n"
-            action = "injected session delete runtime"
-
+        new_content, removed = _strip_legacy_runtime_blocks(content, path)
+        if PATCH_MARKER_BEGIN not in new_content:
+            new_content = new_content.rstrip() + "\n" + PATCH_MARKER_SCRIPT
         if new_content == content:
             continue
-        if write_text_best_effort(path, new_content, context="session delete runtime patch"):
+        if write_text_best_effort(path, new_content, context="entry runtime patch"):
             changed += 1
-            print(f"  {path.name}: {action}")
+            print(f"  {path.name}: entry runtime updated (legacy blocks removed: {removed})")
     return changed
-
-
-INJECTED_BLOCK_MARKERS = (
-    ("// __CLAUDE_ZH_CN_FONT_PATCH_BEGIN__", "// __CLAUDE_ZH_CN_FONT_PATCH_END__"),
-    ("// __CLAUDE_ZH_CN_SESSION_DELETE_PATCH_BEGIN__", "// __CLAUDE_ZH_CN_SESSION_DELETE_PATCH_END__"),
-)
 
 
 def replace_outside_injected_blocks(content: str, replacements: list[tuple[str, str]]) -> tuple[str, int]:
@@ -3704,9 +442,16 @@ def replace_outside_injected_blocks(content: str, replacements: list[tuple[str, 
     return "".join(pieces), changed
 
 
-def _apply_replacements(fpath: Path, replacements: list[tuple[str, str]], assets_dir: Path) -> int:
+def _apply_replacements(
+    fpath: Path,
+    replacements: list[tuple[str, str]],
+    assets_dir: Path,
+    *,
+    backup: bool = True,
+) -> int:
     """对单个 chunk js 应用替换并写回,返回成功替换数。"""
-    backup_file(fpath, assets_dir)
+    if backup and not backup_file(fpath, assets_dir):
+        raise OSError(f"Failed to back up chunk target: {fpath}")
     content = fpath.read_text(encoding="utf-8")
     content, changed = replace_outside_injected_blocks(content, replacements)
     if changed > 0 and write_text_best_effort(fpath, content, context="chunk replacement"):
@@ -3721,6 +466,7 @@ def patch_assets_tree(
     *,
     mode: str = "full",
     target_sink: set[str] | None = None,
+    backup: bool = True,
 ) -> int:
     """Patch every assets directory, using narrow prefix discovery when possible.
 
@@ -3764,7 +510,7 @@ def patch_assets_tree(
         for _, replacements, files in direct:
             for fpath in files:
                 remember(fpath, assets_dir)
-                total += _apply_replacements(fpath, replacements, assets_dir)
+                total += _apply_replacements(fpath, replacements, assets_dir, backup=backup)
 
         if needle_groups and mode == "full":
             report(25, "首次适配当前版本，正在定位入口 JS chunk...")
@@ -3811,24 +557,28 @@ def patch_assets_tree(
                     replacements = [
                         pair for pair in by_pattern[pattern] if pair[0] in found_needles
                     ]
-                    total += _apply_replacements(fpath, replacements, assets_dir)
+                    total += _apply_replacements(fpath, replacements, assets_dir, backup=backup)
         elif needle_groups:
             report(60, "已识别旧版补丁，跳过全量 JS 扫描")
 
         for path in sorted(assets_dir.glob("index-*.js")):
             remember(path, assets_dir)
-        font_patches = patch_font_runtime(assets_dir)
-        if font_patches:
-            total += font_patches
-
-        session_patches = patch_session_delete_runtime(assets_dir)
-        if session_patches:
-            total += session_patches
+        total += patch_entry_runtime(assets_dir, backup=backup)
 
     return total
 
 
 PATCHES: dict[str, list[tuple[str, str]]] = {}
+
+# Current desktop navigation/provider labels live in shared chunks. Match
+# their semantic keys rather than replacing product names or icon names.
+PATCHES["shared-*.js"] = [
+    ('key:"task",label:"Cowork"', 'key:"task",label:"办公"'),
+    ('key:"code",label:"Code"', 'key:"code",label:"编码"'),
+    ('mode:"cowork",icon:"Tasks",label:"Cowork"', 'mode:"cowork",icon:"Tasks",label:"办公"'),
+    ('mode:"code",icon:"Code",label:"Code"', 'mode:"code",icon:"Code",label:"编码"'),
+    ('gateway:"Gateway",anthropic:', 'gateway:"第三方API",anthropic:'),
+]
 
 # === 3P settings page (c71860c77-DNv5VYLZ.js) ===
 PATCHES["c71860c77-DNv5VYLZ.js"] = [
@@ -3868,6 +618,14 @@ PATCHES["c71860c77-DNv5VYLZ.js"] = [
 # Use a deliberately non-matching file name so find_patch_targets scans JS chunks
 # and only touches files that actually contain one of these exact needles.
 PATCHES["__claude_zh_cn_hardcoded_ui__.js"] = [
+    ('defaultMessage:"New",id:"bW7B87wFFp"', 'defaultMessage:"\u65b0\u5efa",id:"bW7B87wFFp"'),
+    ('defaultMessage:"\u65b0",id:"bW7B87wFFp"', 'defaultMessage:"\u65b0\u5efa",id:"bW7B87wFFp"'),
+    ('defaultMessage:"Projects",id:"UxTJRaKagI"', 'defaultMessage:"\u9879\u76ee",id:"UxTJRaKagI"'),
+    ('defaultMessage:"Artifacts",id:"eW5eoWkxy3"', 'defaultMessage:"\u4f5c\u54c1",id:"eW5eoWkxy3"'),
+    ('defaultMessage:"Scheduled",id:"cXAlMRerxW"', 'defaultMessage:"\u5b9a\u65f6",id:"cXAlMRerxW"'),
+    ('defaultMessage:"\u5df2\u5b89\u6392",id:"cXAlMRerxW"', 'defaultMessage:"\u5b9a\u65f6",id:"cXAlMRerxW"'),
+    ('defaultMessage:"Customize",id:"TXpOBiuxud"', 'defaultMessage:"\u5b9a\u5236",id:"TXpOBiuxud"'),
+    ('defaultMessage:"\u81ea\u5b9a\u4e49",id:"TXpOBiuxud"', 'defaultMessage:"\u5b9a\u5236",id:"TXpOBiuxud"'),
     ('defaultMessage:"Connect new sessions to Remote Control",id:"27JV/WKOdz"', 'defaultMessage:"\u65b0\u4f1a\u8bdd\u81ea\u52a8\u8fde\u63a5\u8fdc\u7a0b\u63a7\u5236",id:"27JV/WKOdz"'),
     ('defaultMessage:"Sessions you start on this computer connect to Remote Control automatically, so you can continue them from the terminal or claude.ai/code.",id:"XXiUYflqZf"', 'defaultMessage:"\u5728\u6b64\u7535\u8111\u4e0a\u542f\u52a8\u7684\u4f1a\u8bdd\u5c06\u81ea\u52a8\u8fde\u63a5\u8fdc\u7a0b\u63a7\u5236\uff0c\u4ee5\u4fbf\u4f60\u53ef\u4ee5\u4ece\u7ec8\u7aef\u6216 claude.ai/code \u7ee7\u7eed\u64cd\u4f5c\u3002",id:"XXiUYflqZf"'),
     ('defaultMessage:"Archive inactive sessions",id:"Va2aVQRIyJ"', 'defaultMessage:"\u81ea\u52a8\u5f52\u6863\u95f2\u7f6e\u4f1a\u8bdd",id:"Va2aVQRIyJ"'),
@@ -3902,6 +660,10 @@ PATCHES["__claude_zh_cn_hardcoded_ui__.js"] = [
     ('label:"Projects"', 'label:"\u9879\u76ee"'),
     ('label:"Artifacts"', 'label:"\u4f5c\u54c1"'),
     ('label:"\u5de5\u4ef6"', 'label:"\u4f5c\u54c1"'),
+    ('artifactLabel="Artifacts"', 'artifactLabel="\u4f5c\u54c1"'),
+    ('artifactLabel="\u5de5\u4ef6"', 'artifactLabel="\u4f5c\u54c1"'),
+    ('artifactLabel="\u4eba\u5de5\u5236\u54c1"', 'artifactLabel="\u4f5c\u54c1"'),
+    ('artifactLabel="\u5de5\u827a\u54c1"', 'artifactLabel="\u4f5c\u54c1"'),
     ('label:"Scheduled"', 'label:"\u5b9a\u65f6"'),
     ('label:"\u5df2\u5b89\u6392"', 'label:"\u5b9a\u65f6"'),
     ('label:"Customize"', 'label:"\u5b9a\u5236"'),
@@ -4072,7 +834,6 @@ PATCHES["__claude_zh_cn_hardcoded_ui__.js"] = [
     ('"New session"', '"\u65b0\u5efa\u4f1a\u8bdd"'),
     ('"New Projects"', '"\u65b0\u5efa\u9879\u76ee"'),
     ('"Scheduled"', '"\u5b9a\u65f6"'),
-    ('"Customize"', '"\u5b9a\u5236"'),
     ('"Status"', '"\u72b6\u6001"'),
     ('"Last activity"', '"\u6700\u8fd1\u6d3b\u52a8"'),
     ('"Group by"', '"\u5206\u7ec4\u65b9\u5f0f"'),
@@ -4254,7 +1015,33 @@ PATCHES["index-*.js"] = [
 ]
 
 
-def apply_chunks_with_cache(app_dir: Path, app_resources: Path, progress_cb=None) -> dict:
+def collect_chunk_mutation_targets(app_resources: Path) -> list[Path]:
+    """Return the closed file set that chunk patching may modify.
+
+    Unknown hashed replacements are deliberately limited to index bundles by
+    ``patch_assets_tree``; including every index file here therefore seals the
+    cold-discovery fallback without scanning/copying unrelated asset chunks.
+    """
+    targets: set[Path] = set()
+    for assets_dir in iter_assets_dirs(app_resources):
+        targets.update(path for path in assets_dir.glob("index-*.js") if path.is_file())
+        for pattern in PATCHES:
+            files = [path for path in assets_dir.glob(pattern) if path.is_file()]
+            if not files:
+                prefix = stable_prefix_pattern(pattern)
+                if prefix:
+                    files = [path for path in assets_dir.glob(prefix) if path.is_file()]
+            targets.update(files)
+    return sorted(targets, key=lambda path: path.as_posix().lower())
+
+
+def apply_chunks_with_cache(
+    app_dir: Path,
+    app_resources: Path,
+    progress_cb=None,
+    *,
+    backup: bool = True,
+) -> dict:
     """Apply chunks through cache-hit, legacy-upgrade, or full-discovery paths."""
 
     def report(percent: int, message: str) -> None:
@@ -4288,12 +1075,20 @@ def apply_chunks_with_cache(app_dir: Path, app_resources: Path, progress_cb=None
     else:
         report(20, "首次适配当前 Claude 版本...")
 
+    if backup:
+        for path in collect_chunk_mutation_targets(app_resources):
+            # Every target belongs to one of the discovered assets directories.
+            assets_dir = path.parent
+            if not backup_file(path, assets_dir):
+                raise OSError(f"Failed to back up chunk mutation plan: {path}")
+
     targets: set[str] = set()
     total = patch_assets_tree(
         app_resources,
         progress_cb=progress_cb,
         mode="upgrade" if upgrade_mode else "full",
         target_sink=targets,
+        backup=False,
     )
     fingerprint_after = assets_fingerprint(app_resources)
     save_chunk_state(
@@ -4343,17 +1138,15 @@ def main() -> int:
     BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
     patch_result = apply_chunks_with_cache(app_dir, app_dir / "resources")
     total = patch_result["chunk_patches"]
-    config_mirrored = set_font_config_mirror()
 
     print(f"Done. Total chunk patches: {total}")
     print(f"Chunk cache hit: {patch_result['cache_hit']}")
     print(f"Legacy upgrade mode: {patch_result['upgrade_mode']}")
-    print(f"Font config mirrored: {config_mirrored}")
     return 0
 
 
-def run_patch_chunks(app_dir, progress_cb=None) -> dict:
-    """Programmatic entry: chunk text replacements + font/session runtime injection.
+def run_patch_chunks(app_dir, progress_cb=None, *, backup: bool = True) -> dict:
+    """Programmatic entry: chunk text replacements + entry fingerprint marker.
 
     Unlike main(), returns a dict and does NOT self-elevate. progress_cb is an
     optional callable(percent, message).
@@ -4377,20 +1170,24 @@ def run_patch_chunks(app_dir, progress_cb=None) -> dict:
             "duration_ms": int((time.time() - t0) * 1000),
         }
 
-    if not ensure_windowsapps_writable(app_dir):
+    report(10, "写入 JS chunk 文案替换与补丁指纹...")
+    try:
+        if backup:
+            BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+        patch_result = apply_chunks_with_cache(
+            app_dir,
+            app_resources,
+            progress_cb=report,
+            backup=backup,
+        )
+    except OSError as exc:
         return {
             "success": False,
-            "error": "无法获取写入权限（WindowsApps 提权失败），请以管理员身份运行后再试。",
+            "error": str(exc),
             "chunk_patches": 0,
             "duration_ms": int((time.time() - t0) * 1000),
         }
-
-    report(10, "写入 JS chunk 文案替换与运行时注入...")
-    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
-    patch_result = apply_chunks_with_cache(app_dir, app_resources, progress_cb=report)
     total = patch_result["chunk_patches"]
-    report(85, "写入字体配置镜像...")
-    config_mirrored = set_font_config_mirror()
     report(100, "chunk 补丁完成")
 
     return {
@@ -4400,7 +1197,6 @@ def run_patch_chunks(app_dir, progress_cb=None) -> dict:
         "cache_hit": patch_result["cache_hit"],
         "upgrade_mode": patch_result["upgrade_mode"],
         "target_files": patch_result["target_files"],
-        "font_config_mirrored": config_mirrored,
         "duration_ms": int((time.time() - t0) * 1000),
     }
 

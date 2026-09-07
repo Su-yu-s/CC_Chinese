@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=['core'],
     binaries=[],
-    datas=[('core', 'core'), ('assets', 'assets')],
+    datas=[('core/resources', 'core/resources'), ('assets', 'assets')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -41,6 +41,6 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    upx_exclude=['libGLESv2.dll', 'libEGL.dll', 'd3dcompiler_47.dll', 'QtWebEngineProcess.exe'],
+    upx_exclude=['libGLESv2.dll', 'libEGL.dll', 'd3dcompiler_47.dll', 'QtWebEngineProcess.exe', '_uuid.pyd', 'python3.dll'],
     name='CC_Chinese',
 )

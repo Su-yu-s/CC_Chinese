@@ -16,3 +16,10 @@ tests/
 
 # 下载的 UPX 二进制
 scripts/upx/
+
+# IDE 配置
+.idea/
+.workbuddy/
+
+# 一次性修复脚本
+fix_quotes.py
