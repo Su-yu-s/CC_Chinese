@@ -59,7 +59,7 @@ onedir 产物：`dist/CC_Chinese/CC_Chinese.exe`
 
 安装包产物：`release/CC_Chinese_Setup.exe`
 
-主要隔离测试：
+主要隔离测试（在本地 `tests/` 目录下运行）：
 
 ```powershell
 py -3.13 tests/test_backup_manifest.py
@@ -75,18 +75,36 @@ py -3.13 tests/test_freeze_guards.py
 
 ```text
 main.py                  GUI、状态机、管理员主进程入口
-core/detector.py         安装定位与真实状态检测
-core/compatibility.py    资源结构兼容性门控
-core/backup_manifest.py  版本绑定快照与 manifest
-core/safe_io.py          原子文件写入
-core/best_effort_io.py   精确权限事务
-core/installer.py        汉化/恢复事务编排与回滚
-core/patch_json.py       JSON、locale 与白名单补丁
-core/patch_chunks.py     chunk 翻译及运行时增强
-core/restore.py          严格快照恢复命令入口
-core/diagnostics.py      本地脱敏诊断
-core/elevation.py        管理员校验与安全快照目录初始化
+build.py                 PyInstaller onedir 打包脚本
+CC_Chinese.spec          PyInstaller 配置（本地构建用）
+requirements.txt         运行依赖（PySide6）
+LICENSE                  Apache License 2.0
+
+core/
+  __main__.py            提分子进程启动入口
+  detector.py            安装定位与真实状态检测
+  compatibility.py       资源结构兼容性门控
+  backup_manifest.py     版本绑定快照与 manifest
+  safe_io.py             原子文件写入
+  best_effort_io.py      精确权限事务
+  elevation.py           WindowsApps 提权代理
+  installer.py           汉化/恢复事务编排与回滚
+  patch_json.py          JSON、locale 与白名单补丁
+  patch_chunks.py        chunk 翻译及运行时增强
+  restore.py             严格快照恢复命令入口
+  diagnostics.py         本地脱敏诊断
+  window_icon.py         任务栏原生图标设置
+  resources/
+    desktop-zh-CN.json
+    frontend-zh-CN.json
+    statsig-zh-CN.json
+
+assets/                  窗口图标（icon.ico）等静态资源
+scripts/
+  install_upx.py         自动下载 UPX 压缩工具（可选）
 ```
+
+> `tests/`、`build/`、`dist/`、`release/`、`*.iss` 为本地构建产物，不在仓库中。
 
 ## 风险与边界
 
