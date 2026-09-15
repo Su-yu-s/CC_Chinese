@@ -1,0 +1,12 @@
+pub mod detector;
+pub mod compatibility;
+pub mod backup_manifest;
+pub mod safe_io;
+pub mod acl;
+pub mod patch_json;
+pub mod patch_chunks;
+pub mod installer;
+pub mod elevation;
+pub mod diagnostics;
+pub mod errors;
+pub mod proc;
